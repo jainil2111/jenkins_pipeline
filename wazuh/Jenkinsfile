@@ -1,0 +1,104 @@
+// Deploys a Wazuh all-in-one server (indexer + manager + dashboard) and one Wazuh agent
+// onto Ubuntu VMs over SSH, using the Ansible playbooks in wazuh/ansible.
+// Jenkins job Script Path: wazuh/Jenkinsfile
+//
+// Jenkins prerequisites:
+//   - Ansible + git installed on the Jenkins machine
+//   - Credential "deploy-ssh-key" (type: SSH Username with private key) for a user
+//     that has passwordless sudo on both target VMs
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'WAZUH_SERVER_IP', defaultValue: '192.168.11.21', description: 'IP of the Wazuh server VM')
+        string(name: 'WAZUH_AGENT_IP',  defaultValue: '192.168.11.22', description: 'IP of the Wazuh agent VM')
+        string(name: 'AGENT_NAME',      defaultValue: 'wazuh-agent', description: 'Name the agent registers with (no spaces)')
+        string(name: 'WAZUH_VERSION',   defaultValue: '4.14', description: 'Wazuh release line used in the installer URL')
+        booleanParam(name: 'DEPLOY_SERVER',   defaultValue: true,  description: 'Install the Wazuh server (skipped automatically if already installed)')
+        booleanParam(name: 'DEPLOY_AGENT',    defaultValue: true,  description: 'Install and enroll the Wazuh agent')
+        booleanParam(name: 'IGNORE_HW_CHECK', defaultValue: false, description: 'Pass -i to the installer (lab VMs below 2 vCPU / 4 GB RAM)')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        // Lab convenience. For anything beyond a lab, pre-populate known_hosts instead.
+        ANSIBLE_HOST_KEY_CHECKING = 'False'
+        ANSIBLE_STDOUT_CALLBACK   = 'default'
+        ANSIBLE_CALLBACK_RESULT_FORMAT = 'yaml'
+    }
+
+    stages {
+        stage('Generate inventory') {
+            steps {
+                writeFile file: 'wazuh/ansible/inventory.ini', text: """\
+[wazuh_server]
+wazuh-server ansible_host=${params.WAZUH_SERVER_IP}
+
+[wazuh_agents]
+${params.AGENT_NAME} ansible_host=${params.WAZUH_AGENT_IP}
+
+[all:vars]
+ansible_python_interpreter=/usr/bin/python3
+"""
+                sh 'cat wazuh/ansible/inventory.ini'
+            }
+        }
+
+        stage('Connectivity check') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY',
+                                                   usernameVariable: 'SSH_USER')]) {
+                    sh 'ansible all -i wazuh/ansible/inventory.ini -u "$SSH_USER" --private-key "$SSH_KEY" -m ping'
+                    sh 'ansible all -i wazuh/ansible/inventory.ini -u "$SSH_USER" --private-key "$SSH_KEY" -b -m command -a "whoami"'
+                }
+            }
+        }
+
+        stage('Deploy Wazuh server') {
+            when { expression { params.DEPLOY_SERVER } }
+            steps {
+                runPlaybook('wazuh-server.yml',
+                    "-e wazuh_version=${params.WAZUH_VERSION} -e ignore_hw_check=${params.IGNORE_HW_CHECK}")
+            }
+        }
+
+        stage('Deploy Wazuh agent') {
+            when { expression { params.DEPLOY_AGENT } }
+            steps {
+                runPlaybook('wazuh-agent.yml')
+            }
+        }
+
+        stage('Verify agent is Active') {
+            when { expression { params.DEPLOY_AGENT } }
+            steps {
+                runPlaybook('verify.yml')
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Wazuh dashboard: https://${params.WAZUH_SERVER_IP}  (user: admin)"
+            echo "Admin password is on the server: sudo tar -O -xf /root/wazuh-install-files.tar wazuh-install-files/wazuh-passwords.txt"
+        }
+    }
+}
+
+def runPlaybook(String playbook, String extraArgs = '') {
+    withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
+                                       keyFileVariable: 'SSH_KEY',
+                                       usernameVariable: 'SSH_USER')]) {
+        sh """
+            ansible-playbook -i wazuh/ansible/inventory.ini wazuh/ansible/${playbook} \\
+              -u "\$SSH_USER" --private-key "\$SSH_KEY" ${extraArgs}
+        """
+    }
+}
