@@ -120,5 +120,9 @@ pipeline {
         success {
             echo "Packages archived for build #${env.BUILD_NUMBER}. Deploy jobs can use this build number."
         }
+        always {
+            // Packages are now stored in Jenkins; free the space on the build VM (files are root-owned, so use a container)
+            sh 'docker run --rm -v "$OUT:/out" debian:12-slim sh -c "rm -rf /out/*" || true'
+        }
     }
 }
