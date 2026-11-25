@@ -1,0 +1,72 @@
+// Deploys a Wazuh all-in-one server (indexer + manager + dashboard) on an Ubuntu VM.
+// Jenkins job: wazuh-server   |   Script Path: wazuh/server/Jenkinsfile
+// Needs: Ansible + git on Jenkins, credential "deploy-ssh-key" (user with passwordless sudo on the target)
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'WAZUH_SERVER_IP', defaultValue: '192.168.11.21', description: 'IP of the Wazuh server VM')
+        string(name: 'WAZUH_VERSION',   defaultValue: '4.14', description: 'Wazuh release line used in the installer URL')
+        booleanParam(name: 'IGNORE_HW_CHECK', defaultValue: false, description: 'Pass -i to the installer (VMs below 2 vCPU / 4 GB RAM)')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        ANSIBLE_HOST_KEY_CHECKING      = 'False'   // lab convenience
+        ANSIBLE_CALLBACK_RESULT_FORMAT = 'yaml'
+        INVENTORY                      = 'wazuh/ansible/inventory.ini'
+    }
+
+    stages {
+        stage('Generate inventory') {
+            steps {
+                writeFile file: env.INVENTORY, text: """\
+[wazuh_server]
+wazuh-server ansible_host=${params.WAZUH_SERVER_IP}
+
+[all:vars]
+ansible_python_interpreter=/usr/bin/python3
+"""
+                sh 'cat "$INVENTORY"'
+            }
+        }
+
+        stage('Connectivity check') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY',
+                                                   usernameVariable: 'SSH_USER')]) {
+                    sh 'ansible all -i "$INVENTORY" -u "$SSH_USER" --private-key "$SSH_KEY" -b -m command -a "whoami"'
+                }
+            }
+        }
+
+        stage('Deploy Wazuh server') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY',
+                                                   usernameVariable: 'SSH_USER')]) {
+                    sh """
+                        ansible-playbook -i "\$INVENTORY" wazuh/ansible/wazuh-server.yml \\
+                          -u "\$SSH_USER" --private-key "\$SSH_KEY" \\
+                          -e wazuh_version=${params.WAZUH_VERSION} \\
+                          -e ignore_hw_check=${params.IGNORE_HW_CHECK}
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Wazuh dashboard: https://${params.WAZUH_SERVER_IP}  (user: admin)"
+            echo "Admin password (run on the server): sudo tar -O -xf /root/wazuh-install-files.tar wazuh-install-files/wazuh-passwords.txt"
+        }
+    }
+}

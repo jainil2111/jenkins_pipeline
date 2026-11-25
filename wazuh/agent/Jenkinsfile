@@ -1,0 +1,92 @@
+// Installs a Wazuh agent on an Ubuntu VM and enrolls it with an existing Wazuh server.
+// Jenkins job: wazuh-agent   |   Script Path: wazuh/agent/Jenkinsfile
+// Run the wazuh-server job first. Re-run this job once per machine you want to monitor.
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'WAZUH_SERVER_IP', defaultValue: '192.168.11.21', description: 'IP of the existing Wazuh server')
+        string(name: 'WAZUH_AGENT_IP',  defaultValue: '192.168.11.22', description: 'IP of the machine to install the agent on')
+        string(name: 'AGENT_NAME',      defaultValue: 'wazuh-agent',   description: 'Name the agent registers with (unique, no spaces)')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 20, unit: 'MINUTES')
+    }
+
+    environment {
+        ANSIBLE_HOST_KEY_CHECKING      = 'False'   // lab convenience
+        ANSIBLE_CALLBACK_RESULT_FORMAT = 'yaml'
+        INVENTORY                      = 'wazuh/ansible/inventory.ini'
+    }
+
+    stages {
+        stage('Generate inventory') {
+            steps {
+                writeFile file: env.INVENTORY, text: """\
+[wazuh_server]
+wazuh-server ansible_host=${params.WAZUH_SERVER_IP}
+
+[wazuh_agents]
+${params.AGENT_NAME} ansible_host=${params.WAZUH_AGENT_IP}
+
+[all:vars]
+ansible_python_interpreter=/usr/bin/python3
+"""
+                sh 'cat "$INVENTORY"'
+            }
+        }
+
+        stage('Connectivity check') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY',
+                                                   usernameVariable: 'SSH_USER')]) {
+                    sh 'ansible all -i "$INVENTORY" -u "$SSH_USER" --private-key "$SSH_KEY" -b -m command -a "whoami"'
+                }
+            }
+        }
+
+        stage('Check Wazuh server is installed') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY',
+                                                   usernameVariable: 'SSH_USER')]) {
+                    sh '''
+                        ansible wazuh_server -i "$INVENTORY" -u "$SSH_USER" --private-key "$SSH_KEY" -b \
+                          -m command -a "/var/ossec/bin/wazuh-control info -v" \
+                        || { echo "Wazuh server not found at $WAZUH_SERVER_IP - run the wazuh-server job first."; exit 1; }
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Wazuh agent') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY',
+                                                   usernameVariable: 'SSH_USER')]) {
+                    sh 'ansible-playbook -i "$INVENTORY" wazuh/ansible/wazuh-agent.yml -u "$SSH_USER" --private-key "$SSH_KEY"'
+                }
+            }
+        }
+
+        stage('Verify agent is Active') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY',
+                                                   usernameVariable: 'SSH_USER')]) {
+                    sh 'ansible-playbook -i "$INVENTORY" wazuh/ansible/verify.yml -u "$SSH_USER" --private-key "$SSH_KEY"'
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Agent '${params.AGENT_NAME}' (${params.WAZUH_AGENT_IP}) is Active on https://${params.WAZUH_SERVER_IP}"
+        }
+    }
+}
