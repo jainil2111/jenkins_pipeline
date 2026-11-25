@@ -12,6 +12,7 @@ pipeline {
         booleanParam(name: 'BUILD_MANAGER', defaultValue: true,  description: 'Build wazuh-manager .deb')
         booleanParam(name: 'KEEP_DEBUG',    defaultValue: false, description: 'Also archive the -dbg packages (large)')
         string(name: 'JOBS', defaultValue: '6', description: 'Parallel compile jobs (-j)')
+        booleanParam(name: 'PUBLISH', defaultValue: true, description: 'Publish packages to the lab apt repo (http://192.168.11.20/wazuh-repo/)')
     }
 
     options {
@@ -112,6 +113,37 @@ pipeline {
                     sha512sum -c *.sha512
                 '''
                 archiveArtifacts artifacts: 'out/*.deb, out/*.sha512', fingerprint: true
+            }
+        }
+
+        stage('Publish to repo') {
+            when { expression { params.PUBLISH } }
+            agent { label 'built-in' }      // the Jenkins VM, where /srv/wazuh-repo lives
+            environment {
+                REPO = '/srv/wazuh-repo'
+                KEEP = '5'                  // versions to keep per package
+            }
+            steps {
+                sh 'rm -rf pub'
+                unarchive mapping: ['out/': 'pub/']
+                sh '''
+                    set -e
+                    cd pub
+                    for f in $(find . -name '*.sha512'); do (cd "$(dirname "$f")" && sha512sum -c "$(basename "$f")"); done
+                    find . -name '*.deb' -exec cp -v {} "$REPO/pool/" \\;
+
+                    cd "$REPO"
+                    # Keep only the newest $KEEP versions of each package
+                    for pkg in $(ls pool/*.deb | xargs -n1 basename | cut -d_ -f1 | sort -u); do
+                        ls -t pool/${pkg}_*.deb | tail -n +$((KEEP + 1)) | xargs -r rm -v
+                    done
+
+                    # Rebuild the apt index
+                    dpkg-scanpackages --multiversion pool /dev/null 2>/dev/null > Packages
+                    gzip -9c Packages > Packages.gz
+                    echo "Repo now contains:"
+                    grep -E '^(Package|Version):' Packages | paste - -
+                '''
             }
         }
     }
