@@ -1,0 +1,124 @@
+// Builds Wazuh .deb packages from YOUR forks, using the versions pinned in wazuh-platform.
+// Jenkins job: build-wazuh   |   Script Path: wazuh/build/Jenkinsfile
+// Runs on the node labelled "build" (needs Docker + git). Packages are archived in Jenkins.
+
+pipeline {
+    agent { label 'build' }
+
+    parameters {
+        string(name: 'PLATFORM_REF', defaultValue: 'main', description: 'Branch/tag/commit of wazuh-platform to build (its latest commit pins all fork versions)')
+        string(name: 'WAZUH_REF',    defaultValue: '',     description: 'Optional: branch/tag/commit of your wazuh fork to build instead of the pinned commit. Empty = use the pin')
+        booleanParam(name: 'BUILD_AGENT',   defaultValue: true,  description: 'Build wazuh-agent .deb')
+        booleanParam(name: 'BUILD_MANAGER', defaultValue: true,  description: 'Build wazuh-manager .deb')
+        booleanParam(name: 'KEEP_DEBUG',    defaultValue: false, description: 'Also archive the -dbg packages (large)')
+        string(name: 'JOBS', defaultValue: '6', description: 'Parallel compile jobs (-j)')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 4, unit: 'HOURS')          // first run builds the Docker images (slow); later runs are much faster
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '15', artifactNumToKeepStr: '3'))
+    }
+
+    environment {
+        PLATFORM_URL = 'https://github.com/jainil2111/wazuh-platform.git'
+        SRC = "${WORKSPACE}/src"
+        OUT = "${WORKSPACE}/out"
+    }
+
+    stages {
+        stage('Resolve pinned versions') {
+            steps {
+                sh '''
+                    set -e
+                    rm -rf platform && git clone --quiet "$PLATFORM_URL" platform
+                    cd platform && git checkout --quiet "$PLATFORM_REF"
+                    echo "wazuh-platform $PLATFORM_REF @ $(git rev-parse --short HEAD)"
+                    git config -f .gitmodules submodule.wazuh.url > ../wazuh.url
+                    if [ -n "$WAZUH_REF" ]; then
+                        # Override: build the requested branch/tag/commit of the fork (branch = its latest commit)
+                        echo "$WAZUH_REF" > ../wazuh.sha
+                        echo "OVERRIDE: wazuh fork ref '$WAZUH_REF' (not the pinned commit)"
+                    else
+                        # Default: the commit pinned in wazuh-platform
+                        git ls-tree HEAD wazuh | awk '{print $3}' > ../wazuh.sha
+                        echo "PINNED: wazuh fork @ $(cut -c1-10 ../wazuh.sha)"
+                    fi
+                    echo "wazuh fork: $(cat ../wazuh.url)"
+                '''
+            }
+        }
+
+        stage('Fetch wazuh source') {
+            steps {
+                sh '''
+                    set -e
+                    mkdir -p "$SRC/wazuh" && cd "$SRC/wazuh"
+                    [ -d .git ] || { git init --quiet && git remote add origin "$(cat "$WORKSPACE/wazuh.url")"; }
+                    git remote set-url origin "$(cat "$WORKSPACE/wazuh.url")"
+                    # Fetch only the pinned commit (fast; no full history)
+                    git fetch --quiet --depth 1 origin "$(cat "$WORKSPACE/wazuh.sha")"
+                    git checkout --quiet --force FETCH_HEAD
+                    git clean -fdxq
+                    echo "Building from $(git rev-parse --short HEAD)"
+                '''
+            }
+        }
+
+        stage('Prepare output') {
+            steps {
+                // Old packages were written by root inside Docker; remove them via a container
+                sh '''
+                    mkdir -p "$OUT"
+                    docker run --rm -v "$OUT:/out" debian:12-slim sh -c 'rm -rf /out/*'
+                '''
+            }
+        }
+
+        stage('Build agent') {
+            when { expression { params.BUILD_AGENT } }
+            steps {
+                sh '''
+                    cd "$SRC/wazuh/packages"
+                    ./generate_package.sh -t agent -a amd64 --system deb \
+                        -r "$BUILD_NUMBER" -j "$JOBS" --sources "$SRC/wazuh" -s "$OUT"
+                '''
+            }
+        }
+
+        stage('Build manager') {
+            when { expression { params.BUILD_MANAGER } }
+            steps {
+                sh '''
+                    cd "$SRC/wazuh/packages"
+                    ./generate_package.sh -t manager -a amd64 --system deb \
+                        -r "$BUILD_NUMBER" -j "$JOBS" --sources "$SRC/wazuh" -s "$OUT"
+                '''
+            }
+        }
+
+        stage('Checksums & archive') {
+            steps {
+                sh '''
+                    set -e
+                    # Hand files back to the build user, drop debug packages unless asked, write fresh checksums
+                    docker run --rm -v "$OUT:/out" debian:12-slim chown -R "$(id -u):$(id -g)" /out
+                    cd "$OUT"
+                    [ "$KEEP_DEBUG" = "true" ] || rm -f *-dbg_*.deb
+                    rm -f *.sha512
+                    for f in *.deb; do sha512sum "$f" > "$f.sha512"; done
+                    ls -lh
+                    sha512sum -c *.sha512
+                '''
+                archiveArtifacts artifacts: 'out/*.deb, out/*.sha512', fingerprint: true
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Packages archived for build #${env.BUILD_NUMBER}. Deploy jobs can use this build number."
+        }
+    }
+}
