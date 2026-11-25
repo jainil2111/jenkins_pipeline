@@ -1,0 +1,85 @@
+---
+# Installs Wazuh indexer, manager and dashboard on one host using the official
+# installation assistant. Safe to re-run: skips the install if the manager exists.
+- name: Install Wazuh central components (all-in-one)
+  hosts: wazuh_server
+  become: true
+  vars:
+    wazuh_version: "4.14"
+    ignore_hw_check: false
+    wazuh_ports: [443, 1514, 1515, 55000]
+
+  tasks:
+    - name: Check whether Wazuh manager is already installed
+      ansible.builtin.stat:
+        path: /var/ossec/bin/wazuh-control
+      register: wazuh_ctl
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name: [curl, tar, gnupg, apt-transport-https, lsb-release]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Download the Wazuh installation assistant
+      ansible.builtin.get_url:
+        url: "https://packages.wazuh.com/{{ wazuh_version }}/wazuh-install.sh"
+        dest: /root/wazuh-install.sh
+        mode: "0700"
+      when: not wazuh_ctl.stat.exists
+
+    - name: Run all-in-one install (takes 10-20 minutes)
+      ansible.builtin.command:
+        cmd: "bash /root/wazuh-install.sh -a{{ ' -i' if (ignore_hw_check | bool) else '' }}"
+        chdir: /root
+        creates: /var/ossec/bin/wazuh-control
+      async: 2700
+      poll: 30
+      when: not wazuh_ctl.stat.exists
+
+    - name: Ensure Wazuh services are enabled and running
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: [wazuh-indexer, wazuh-manager, wazuh-dashboard]
+
+    - name: Wait for agent connection, enrollment and dashboard ports
+      ansible.builtin.wait_for:
+        port: "{{ item }}"
+        timeout: 300
+      loop: [1514, 1515, 443]
+
+    - name: Check whether UFW is active
+      ansible.builtin.shell: 'ufw status | grep -q "Status: active"'
+      register: ufw_active
+      changed_when: false
+      failed_when: false
+
+    - name: Open Wazuh ports in UFW
+      ansible.builtin.command: "ufw allow {{ item }}/tcp"
+      loop: "{{ wazuh_ports }}"
+      when: ufw_active.rc == 0
+      changed_when: true
+
+    - name: Check for Wazuh apt repo file
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list.d/wazuh.list
+      register: wazuh_repo
+
+    - name: Disable Wazuh apt repo to avoid accidental upgrades (per Wazuh docs)
+      ansible.builtin.replace:
+        path: /etc/apt/sources.list.d/wazuh.list
+        regexp: '^deb '
+        replace: '#deb '
+      when: wazuh_repo.stat.exists
+
+    - name: Read installed manager version
+      ansible.builtin.command: /var/ossec/bin/wazuh-control info -v
+      register: mgr_version
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "Wazuh manager {{ mgr_version.stdout | trim }} is running on {{ ansible_host }}"

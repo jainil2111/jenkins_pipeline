@@ -1,0 +1,91 @@
+---
+# Installs the Wazuh agent pinned to the manager's exact version (an agent must
+# never be newer than its manager) and enrolls it with the manager.
+- name: Read Wazuh manager version
+  hosts: wazuh_server
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Get manager version
+      ansible.builtin.command: /var/ossec/bin/wazuh-control info -v
+      register: mgr_ver
+      changed_when: false
+
+    - name: Store version (e.g. 4.14.1)
+      ansible.builtin.set_fact:
+        wazuh_manager_version: "{{ mgr_ver.stdout | trim | regex_replace('^v', '') }}"
+
+- name: Install and enroll Wazuh agent
+  hosts: wazuh_agents
+  become: true
+  vars:
+    manager_host: "{{ groups['wazuh_server'][0] }}"
+    manager_ip: "{{ hostvars[manager_host].ansible_host }}"
+    agent_version: "{{ hostvars[manager_host].wazuh_manager_version }}"
+    agent_name: "{{ inventory_hostname }}"
+
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name: [curl, gnupg, apt-transport-https]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Import Wazuh GPG key
+      ansible.builtin.shell: >
+        curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH
+        | gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import
+      args:
+        creates: /usr/share/keyrings/wazuh.gpg
+
+    - name: Make keyring readable by apt
+      ansible.builtin.file:
+        path: /usr/share/keyrings/wazuh.gpg
+        mode: "0644"
+
+    - name: Add Wazuh apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/wazuh.list
+        content: "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main\n"
+        mode: "0644"
+      register: wazuh_repo
+
+    - name: Refresh apt cache
+      ansible.builtin.apt:
+        update_cache: true
+      when: wazuh_repo.changed
+
+    - name: Install wazuh-agent {{ agent_version }}
+      ansible.builtin.apt:
+        name: "wazuh-agent={{ agent_version }}-1"
+        state: present
+      environment:
+        WAZUH_MANAGER: "{{ manager_ip }}"
+        WAZUH_AGENT_NAME: "{{ agent_name }}"
+      notify: Restart wazuh-agent
+
+    - name: Point agent at the manager (also fixes re-runs with a new server IP)
+      ansible.builtin.replace:
+        path: /var/ossec/etc/ossec.conf
+        regexp: '<address>.*</address>'
+        replace: '<address>{{ manager_ip }}</address>'
+      notify: Restart wazuh-agent
+
+    - name: Hold wazuh-agent so apt upgrade can't move it past the manager
+      ansible.builtin.dpkg_selections:
+        name: wazuh-agent
+        selection: hold
+
+    - name: Enable and start wazuh-agent
+      ansible.builtin.systemd:
+        name: wazuh-agent
+        daemon_reload: true
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Restart wazuh-agent
+      ansible.builtin.systemd:
+        name: wazuh-agent
+        state: restarted
