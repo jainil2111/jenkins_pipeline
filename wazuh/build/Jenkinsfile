@@ -120,6 +120,9 @@ pipeline {
                     git checkout --quiet --force FETCH_HEAD
                     git clean -fdq                 # keep ignored Gradle caches for faster rebuilds
                     rm -rf artifacts
+                    # Pre-create the output folder: if Docker creates it for the bind mount it is root-owned
+                    # and the build container's user gets "Permission denied"
+                    mkdir -p artifacts
                     chmod -R a+rwX .
                     VER="$(bash packaging_scripts/product_version.sh)"
                     echo "wazuh-indexer @ $SHORT, version $VER"
@@ -127,6 +130,8 @@ pipeline {
                     # Start build containers; ALWAYS stop them afterwards (they hold ~3 GB RAM)
                     (cd docker/ci && bash ./ci.sh up)
                     trap 'cd "$IDX/docker/ci" && bash ./ci.sh stop || true' EXIT
+                    # Safety net: re-open anything the containers' startup made root-owned
+                    docker run --rm -v "$IDX:/x" debian:12-slim sh -c 'mkdir -p /x/artifacts && chmod -R a+rwX /x/artifacts'
 
                     docker exec "wi-build_$VER"    bash packaging_scripts/build.sh    -a x64 -d deb
                     docker exec "wi-assemble_$VER" bash packaging_scripts/assemble.sh -a x64 -d deb -r "$BUILD_NUMBER"
