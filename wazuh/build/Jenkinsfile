@@ -123,7 +123,8 @@ pipeline {
                     # Pre-create the output folder: if Docker creates it for the bind mount it is root-owned
                     # and the build container's user gets "Permission denied"
                     mkdir -p artifacts
-                    chmod -R a+rwX .
+                    # Run as root in a container: files made by the build containers (e.g. .gradle) aren't ours to chmod
+                    docker run --rm -v "$IDX:/x" debian:12-slim chmod -R a+rwX /x
                     VER="$(bash packaging_scripts/product_version.sh)"
                     echo "wazuh-indexer @ $SHORT, version $VER"
 
