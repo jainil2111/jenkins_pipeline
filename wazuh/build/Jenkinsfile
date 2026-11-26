@@ -1,23 +1,27 @@
 // Builds Wazuh .deb packages from YOUR forks, using the versions pinned in wazuh-platform.
 // Jenkins job: build-wazuh   |   Script Path: wazuh/build/Jenkinsfile
-// Runs on the node labelled "build" (needs Docker + git). Packages are archived in Jenkins.
+// Runs on the node labelled "build" (needs Docker + docker compose + git). Packages are archived
+// in Jenkins and (optionally) published to the lab apt repo on the Jenkins VM.
 
 pipeline {
     agent { label 'build' }
 
     parameters {
         string(name: 'PLATFORM_REF', defaultValue: 'main', description: 'Branch/tag/commit of wazuh-platform to build (its latest commit pins all fork versions)')
-        string(name: 'WAZUH_REF',    defaultValue: '',     description: 'Optional: branch/tag/commit of your wazuh fork to build instead of the pinned commit. Empty = use the pin')
-        booleanParam(name: 'BUILD_AGENT',   defaultValue: true,  description: 'Build wazuh-agent .deb')
-        booleanParam(name: 'BUILD_MANAGER', defaultValue: true,  description: 'Build wazuh-manager .deb')
-        booleanParam(name: 'KEEP_DEBUG',    defaultValue: false, description: 'Also archive the -dbg packages (large)')
-        string(name: 'JOBS', defaultValue: '6', description: 'Parallel compile jobs (-j)')
+        string(name: 'WAZUH_REF',    defaultValue: '',     description: 'Optional: branch/tag/commit of your wazuh fork (agent/manager) instead of the pinned commit. Empty = use the pin')
+        booleanParam(name: 'BUILD_AGENT',     defaultValue: true,  description: 'Build wazuh-agent .deb')
+        booleanParam(name: 'BUILD_MANAGER',   defaultValue: true,  description: 'Build wazuh-manager .deb')
+        booleanParam(name: 'BUILD_INDEXER',   defaultValue: true,  description: 'Build wazuh-indexer .deb')
+        booleanParam(name: 'BUILD_DASHBOARD', defaultValue: true,  description: 'Build wazuh-dashboard .deb')
+        booleanParam(name: 'FORCE_DASHBOARD_PLATFORM', defaultValue: false, description: 'Rebuild the dashboard platform even if the wazuh-dashboard commit is unchanged (~1h extra)')
+        booleanParam(name: 'KEEP_DEBUG',      defaultValue: false, description: 'Also archive the -dbg packages (large)')
+        string(name: 'JOBS', defaultValue: '6', description: 'Parallel compile jobs (-j) for agent/manager')
         booleanParam(name: 'PUBLISH', defaultValue: true, description: 'Publish packages to the lab apt repo (http://192.168.11.20/wazuh-repo/)')
     }
 
     options {
         timestamps()
-        timeout(time: 4, unit: 'HOURS')          // first run builds the Docker images (slow); later runs are much faster
+        timeout(time: 6, unit: 'HOURS')          // a full first build of all 4 components is long
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '15', artifactNumToKeepStr: '3'))
     }
@@ -36,43 +40,41 @@ pipeline {
                     rm -rf platform && git clone --quiet "$PLATFORM_URL" platform
                     cd platform && git checkout --quiet "$PLATFORM_REF"
                     echo "wazuh-platform $PLATFORM_REF @ $(git rev-parse --short HEAD)"
-                    git config -f .gitmodules submodule.wazuh.url > ../wazuh.url
+                    for m in wazuh wazuh-indexer wazuh-dashboard wazuh-dashboard-plugins wazuh-security-dashboards-plugin; do
+                        git ls-tree HEAD "$m" | awk '{print $3}'    > "../$m.sha"
+                        git config -f .gitmodules "submodule.$m.url" > "../$m.url"
+                        echo "  PINNED: $m @ $(cut -c1-10 "../$m.sha")"
+                    done
                     if [ -n "$WAZUH_REF" ]; then
-                        # Override: build the requested branch/tag/commit of the fork (branch = its latest commit)
                         echo "$WAZUH_REF" > ../wazuh.sha
-                        echo "OVERRIDE: wazuh fork ref '$WAZUH_REF' (not the pinned commit)"
-                    else
-                        # Default: the commit pinned in wazuh-platform
-                        git ls-tree HEAD wazuh | awk '{print $3}' > ../wazuh.sha
-                        echo "PINNED: wazuh fork @ $(cut -c1-10 ../wazuh.sha)"
+                        echo "  OVERRIDE: wazuh fork ref '$WAZUH_REF' (agent/manager)"
                     fi
-                    echo "wazuh fork: $(cat ../wazuh.url)"
-                '''
-            }
-        }
-
-        stage('Fetch wazuh source') {
-            steps {
-                sh '''
-                    set -e
-                    mkdir -p "$SRC/wazuh" && cd "$SRC/wazuh"
-                    [ -d .git ] || { git init --quiet && git remote add origin "$(cat "$WORKSPACE/wazuh.url")"; }
-                    git remote set-url origin "$(cat "$WORKSPACE/wazuh.url")"
-                    # Fetch only the pinned commit (fast; no full history)
-                    git fetch --quiet --depth 1 origin "$(cat "$WORKSPACE/wazuh.sha")"
-                    git checkout --quiet --force FETCH_HEAD
-                    git clean -fdxq
-                    echo "Building from $(git rev-parse --short HEAD)"
                 '''
             }
         }
 
         stage('Prepare output') {
             steps {
-                // Old packages were written by root inside Docker; remove them via a container
+                // Old packages may be root-owned (written by containers); remove them via a container
                 sh '''
                     mkdir -p "$OUT"
                     docker run --rm -v "$OUT:/out" debian:12-slim sh -c 'rm -rf /out/*'
+                '''
+            }
+        }
+
+        stage('Fetch wazuh source') {
+            when { expression { params.BUILD_AGENT || params.BUILD_MANAGER } }
+            steps {
+                sh '''
+                    set -e
+                    mkdir -p "$SRC/wazuh" && cd "$SRC/wazuh"
+                    [ -d .git ] || { git init --quiet && git remote add origin "$(cat "$WORKSPACE/wazuh.url")"; }
+                    git remote set-url origin "$(cat "$WORKSPACE/wazuh.url")"
+                    git fetch --quiet --depth 1 origin "$(cat "$WORKSPACE/wazuh.sha")"
+                    git checkout --quiet --force FETCH_HEAD
+                    git clean -fdxq
+                    echo "Building from $(git rev-parse --short HEAD)"
                 '''
             }
         }
@@ -99,6 +101,72 @@ pipeline {
             }
         }
 
+        stage('Build indexer') {
+            when { expression { params.BUILD_INDEXER } }
+            steps {
+                sh '''
+                    set -e
+                    IDX="$SRC/wazuh-indexer"
+                    SHA="$(cat "$WORKSPACE/wazuh-indexer.sha")"
+                    SHORT="$(echo "$SHA" | cut -c1-7)"
+
+                    # Files may have been written by the build containers as another user: open them up first
+                    if [ -d "$IDX" ]; then docker run --rm -v "$IDX:/x" debian:12-slim chmod -R a+rwX /x; fi
+                    mkdir -p "$IDX" && cd "$IDX"
+                    [ -d .git ] || git init --quiet
+                    git remote remove origin 2>/dev/null || true
+                    git remote add origin "$(cat "$WORKSPACE/wazuh-indexer.url")"
+                    git fetch --quiet --depth 1 origin "$SHA"
+                    git checkout --quiet --force FETCH_HEAD
+                    git clean -fdq                 # keep ignored Gradle caches for faster rebuilds
+                    rm -rf artifacts
+                    chmod -R a+rwX .
+                    VER="$(bash packaging_scripts/product_version.sh)"
+                    echo "wazuh-indexer @ $SHORT, version $VER"
+
+                    # Start build containers; ALWAYS stop them afterwards (they hold ~3 GB RAM)
+                    (cd docker/ci && bash ./ci.sh up)
+                    trap 'cd "$IDX/docker/ci" && bash ./ci.sh stop || true' EXIT
+
+                    docker exec "wi-build_$VER"    bash packaging_scripts/build.sh    -a x64 -d deb
+                    docker exec "wi-assemble_$VER" bash packaging_scripts/assemble.sh -a x64 -d deb -r "$BUILD_NUMBER"
+
+                    # assemble.sh drops the revision from the file name; put it (and the commit) back
+                    cp -v "artifacts/dist/wazuh-indexer_${VER}_amd64.deb" \
+                          "$OUT/wazuh-indexer_${VER}-${BUILD_NUMBER}_amd64_${SHORT}.deb"
+                '''
+            }
+        }
+
+        stage('Build dashboard') {
+            when { expression { params.BUILD_DASHBOARD } }
+            steps {
+                sh '''
+                    set -e
+                    D="$WORKSPACE/dashboard"
+                    DSHA="$(cat "$WORKSPACE/wazuh-dashboard.sha")"
+
+                    # Reuse the (slow) platform build if the wazuh-dashboard commit has not changed
+                    SKIP=0
+                    if [ -f "$D/.platform-sha" ] && [ "$(cat "$D/.platform-sha")" = "$DSHA" ] \
+                       && ls "$D"/wazuh-dashboard/target/opensearch-dashboards-*-linux-x64.tar.gz >/dev/null 2>&1; then
+                        SKIP=1
+                    fi
+                    if [ "$FORCE_DASHBOARD_PLATFORM" = "true" ]; then SKIP=0; fi
+                    echo "Reuse dashboard platform: $SKIP"
+
+                    GH="$(dirname "$(cat "$WORKSPACE/wazuh-dashboard.url")")" \
+                    DASHBOARD_REF="$DSHA" \
+                    PLUGINS_REF="$(cat "$WORKSPACE/wazuh-dashboard-plugins.sha")" \
+                    SECURITY_REF="$(cat "$WORKSPACE/wazuh-security-dashboards-plugin.sha")" \
+                    WORKDIR="$D" OUT="$OUT" REVISION="$BUILD_NUMBER" SKIP_PLATFORM="$SKIP" \
+                    bash wazuh/build/scripts/build-dashboard.sh
+
+                    echo "$DSHA" > "$D/.platform-sha"
+                '''
+            }
+        }
+
         stage('Checksums & archive') {
             steps {
                 sh '''
@@ -121,7 +189,7 @@ pipeline {
             agent { label 'built-in' }      // the Jenkins VM, where /srv/wazuh-repo lives
             environment {
                 REPO = '/srv/wazuh-repo'
-                KEEP = '5'                  // versions to keep per package
+                KEEP = '3'                  // versions to keep per package (indexer alone is ~835 MB each)
             }
             steps {
                 sh 'rm -rf pub'
@@ -150,11 +218,14 @@ pipeline {
 
     post {
         success {
-            echo "Packages archived for build #${env.BUILD_NUMBER}. Deploy jobs can use this build number."
+            echo "Packages archived for build #${env.BUILD_NUMBER}."
         }
         always {
-            // Packages are now stored in Jenkins; free the space on the build VM (files are root-owned, so use a container)
-            sh 'docker run --rm -v "$OUT:/out" debian:12-slim sh -c "rm -rf /out/*" || true'
+            // Free space on the build VM (packages are now in Jenkins); make sure indexer containers are stopped
+            sh '''
+                docker run --rm -v "$OUT:/out" debian:12-slim sh -c "rm -rf /out/*" || true
+                if [ -d "$SRC/wazuh-indexer/docker/ci" ]; then (cd "$SRC/wazuh-indexer/docker/ci" && bash ./ci.sh stop) || true; fi
+            '''
         }
     }
 }
