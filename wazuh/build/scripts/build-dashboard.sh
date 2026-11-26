@@ -37,7 +37,8 @@ step() { echo; echo "=== $* ==="; }
 fetch() {
     local repo=$1 ref=$2 dir=$3
     mkdir -p "$dir"
-    git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || git -C "$dir" init --quiet
+    # Check for $dir/.git itself: "git rev-parse" would also find a PARENT repo (e.g. the Jenkins workspace)
+    [ -d "$dir/.git" ] || git -C "$dir" init --quiet
     git -C "$dir" remote remove origin 2>/dev/null || true
     git -C "$dir" remote add origin "$GH/$repo.git"
     git -C "$dir" fetch --quiet --depth 1 origin "$ref"
