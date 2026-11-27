@@ -1,14 +1,15 @@
-// Deploys a Wazuh all-in-one server (indexer + manager + dashboard) on an Ubuntu VM.
-// Jenkins job: wazuh-server   |   Script Path: wazuh/server/Jenkinsfile
-// Needs: Ansible + git on Jenkins, credential "deploy-ssh-key" (user with passwordless sudo on the target)
+// Deploys an all-in-one Wazuh server (indexer + manager + Filebeat + dashboard) from YOUR packages
+// in the lab apt repo (built by the build-wazuh job).
+// Jenkins job: deploy-wazuh-server   |   Script Path: wazuh/server/Jenkinsfile
+// Needs: Ansible + git on the Jenkins VM, credential "deploy-ssh-key" (user with passwordless sudo on the target)
 
 pipeline {
-    agent any
+    agent { label 'built-in' }     // Ansible lives on the Jenkins VM (not on the build VM)
 
     parameters {
         string(name: 'WAZUH_SERVER_IP', defaultValue: '192.168.11.21', description: 'IP of the Wazuh server VM')
-        string(name: 'WAZUH_VERSION',   defaultValue: '4.14', description: 'Wazuh release line used in the installer URL')
-        booleanParam(name: 'IGNORE_HW_CHECK', defaultValue: false, description: 'Pass -i to the installer (VMs below 2 vCPU / 4 GB RAM)')
+        string(name: 'PLATFORM_REF',    defaultValue: 'main', description: 'wazuh-platform branch/commit: decides which wazuh fork commit the alerts template comes from')
+        booleanParam(name: 'CLEAN_INSTALL', defaultValue: false, description: 'DESTRUCTIVE: remove any existing Wazuh install (data, config, certificates) before installing')
     }
 
     options {
@@ -21,9 +22,41 @@ pipeline {
         ANSIBLE_HOST_KEY_CHECKING      = 'False'   // lab convenience
         ANSIBLE_CALLBACK_RESULT_FORMAT = 'yaml'
         INVENTORY                      = 'wazuh/ansible/inventory.ini'
+        PLATFORM_URL                   = 'https://github.com/jainil2111/wazuh-platform.git'
+        LAB_REPO_URL                   = 'http://192.168.11.20/wazuh-repo'
     }
 
     stages {
+        stage('Resolve pinned wazuh commit') {
+            steps {
+                sh '''
+                    set -e
+                    rm -rf platform && git clone --quiet "$PLATFORM_URL" platform
+                    cd platform && git checkout --quiet "$PLATFORM_REF"
+                    SHA="$(git ls-tree HEAD wazuh | awk '{print $3}')"
+                    URL="$(git config -f .gitmodules submodule.wazuh.url)"
+                    # https://github.com/<owner>/<repo>.git  ->  https://raw.githubusercontent.com/<owner>/<repo>/<sha>
+                    RAW="$(echo "$URL" | sed -e 's#https://github.com/#https://raw.githubusercontent.com/#' -e 's#\\.git$##')/$SHA"
+                    echo "$RAW/extensions/elasticsearch/7.x/wazuh-template.json" > ../template.url
+                    echo "wazuh fork pinned @ $(echo "$SHA" | cut -c1-10)"
+                    echo "Alerts template: $(cat ../template.url)"
+                '''
+            }
+        }
+
+        stage('Check lab repo') {
+            steps {
+                sh '''
+                    set -e
+                    echo "Packages in the lab repo:"
+                    curl -fsS "$LAB_REPO_URL/Packages" | grep -E '^(Package|Version):' | paste - -
+                    for p in wazuh-indexer wazuh-manager wazuh-dashboard; do
+                        curl -fsS "$LAB_REPO_URL/Packages" | grep -qx "Package: $p" || { echo "MISSING in lab repo: $p (run build-wazuh first)"; exit 1; }
+                    done
+                '''
+            }
+        }
+
         stage('Generate inventory') {
             steps {
                 writeFile file: env.INVENTORY, text: """\
@@ -52,12 +85,13 @@ ansible_python_interpreter=/usr/bin/python3
                 withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
                                                    keyFileVariable: 'SSH_KEY',
                                                    usernameVariable: 'SSH_USER')]) {
-                    sh """
-                        ansible-playbook -i "\$INVENTORY" wazuh/ansible/wazuh-server.yml \\
-                          -u "\$SSH_USER" --private-key "\$SSH_KEY" \\
-                          -e wazuh_version=${params.WAZUH_VERSION} \\
-                          -e ignore_hw_check=${params.IGNORE_HW_CHECK}
-                    """
+                    sh '''
+                        ansible-playbook -i "$INVENTORY" wazuh/ansible/wazuh-server.yml \
+                          -u "$SSH_USER" --private-key "$SSH_KEY" \
+                          -e lab_repo_url="$LAB_REPO_URL" \
+                          -e wazuh_template_url="$(cat template.url)" \
+                          -e clean_install="$CLEAN_INSTALL"
+                    '''
                 }
             }
         }
@@ -65,8 +99,7 @@ ansible_python_interpreter=/usr/bin/python3
 
     post {
         success {
-            echo "Wazuh dashboard: https://${params.WAZUH_SERVER_IP}  (user: admin)"
-            echo "Admin password (run on the server): sudo tar -O -xf /root/wazuh-install-files.tar wazuh-install-files/wazuh-passwords.txt"
+            echo "Wazuh dashboard: https://${params.WAZUH_SERVER_IP}   (user: admin / password: admin - change it once it works)"
         }
     }
 }
