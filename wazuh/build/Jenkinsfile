@@ -13,7 +13,8 @@ pipeline {
         booleanParam(name: 'BUILD_MANAGER',   defaultValue: true,  description: 'Build wazuh-manager .deb')
         booleanParam(name: 'BUILD_INDEXER',   defaultValue: true,  description: 'Build wazuh-indexer .deb')
         booleanParam(name: 'BUILD_DASHBOARD', defaultValue: true,  description: 'Build wazuh-dashboard .deb')
-        booleanParam(name: 'FORCE_DASHBOARD_PLATFORM', defaultValue: false, description: 'Rebuild the dashboard platform even if the wazuh-dashboard commit is unchanged (~1h extra)')
+        booleanParam(name: 'FORCE_REBUILD',   defaultValue: false, description: 'Ignore the package cache and rebuild every ticked component (use after changing the build scripts)')
+        booleanParam(name: 'FORCE_DASHBOARD_PLATFORM', defaultValue: false, description: 'Rebuild the dashboard platform even if the wazuh-dashboard commit is unchanged (~25 min extra)')
         booleanParam(name: 'KEEP_DEBUG',      defaultValue: false, description: 'Also archive the -dbg packages (large)')
         string(name: 'JOBS', defaultValue: '6', description: 'Parallel compile jobs (-j) for agent/manager')
         booleanParam(name: 'PUBLISH', defaultValue: true, description: 'Publish packages to the lab apt repo (http://192.168.11.20/wazuh-repo/)')
@@ -30,6 +31,7 @@ pipeline {
         PLATFORM_URL = 'https://github.com/jainil2111/wazuh-platform.git'
         SRC = "${WORKSPACE}/src"
         OUT = "${WORKSPACE}/out"
+        CACHE_SH = "${WORKSPACE}/wazuh/build/scripts/pkg-cache.sh"   // reuse packages built from the same commit
     }
 
     stages {
@@ -83,9 +85,14 @@ pipeline {
             when { expression { params.BUILD_AGENT } }
             steps {
                 sh '''
+                    set -e
+                    KEY="$(cat "$WORKSPACE/wazuh.sha")"
+                    # The cache is keyed by commit, so skip it when WAZUH_REF overrides the pin with a branch name
+                    if [ -z "$WAZUH_REF" ] && bash "$CACHE_SH" get wazuh-agent "$KEY"; then exit 0; fi
                     cd "$SRC/wazuh/packages"
                     ./generate_package.sh -t agent -a amd64 --system deb \
                         -r "$BUILD_NUMBER" -j "$JOBS" --sources "$SRC/wazuh" -s "$OUT"
+                    [ -n "$WAZUH_REF" ] || bash "$CACHE_SH" put wazuh-agent "$KEY" "$OUT"/wazuh-agent_*.deb
                 '''
             }
         }
@@ -94,9 +101,13 @@ pipeline {
             when { expression { params.BUILD_MANAGER } }
             steps {
                 sh '''
+                    set -e
+                    KEY="$(cat "$WORKSPACE/wazuh.sha")"
+                    if [ -z "$WAZUH_REF" ] && bash "$CACHE_SH" get wazuh-manager "$KEY"; then exit 0; fi
                     cd "$SRC/wazuh/packages"
                     ./generate_package.sh -t manager -a amd64 --system deb \
                         -r "$BUILD_NUMBER" -j "$JOBS" --sources "$SRC/wazuh" -s "$OUT"
+                    [ -n "$WAZUH_REF" ] || bash "$CACHE_SH" put wazuh-manager "$KEY" "$OUT"/wazuh-manager_*.deb
                 '''
             }
         }
@@ -109,6 +120,7 @@ pipeline {
                     IDX="$SRC/wazuh-indexer"
                     SHA="$(cat "$WORKSPACE/wazuh-indexer.sha")"
                     SHORT="$(echo "$SHA" | cut -c1-7)"
+                    if bash "$CACHE_SH" get wazuh-indexer "$SHA"; then exit 0; fi
 
                     # Files may have been written by the build containers as another user: open them up first
                     if [ -d "$IDX" ]; then docker run --rm -v "$IDX:/x" debian:12-slim chmod -R a+rwX /x; fi
@@ -140,6 +152,7 @@ pipeline {
                     # assemble.sh drops the revision from the file name; put it (and the commit) back
                     cp -v "artifacts/dist/wazuh-indexer_${VER}_amd64.deb" \
                           "$OUT/wazuh-indexer_${VER}-${BUILD_NUMBER}_amd64_${SHORT}.deb"
+                    bash "$CACHE_SH" put wazuh-indexer "$SHA" "$OUT/wazuh-indexer_${VER}-${BUILD_NUMBER}_amd64_${SHORT}.deb"
                 '''
             }
         }
@@ -151,6 +164,11 @@ pipeline {
                     set -e
                     D="$WORKSPACE/dashboard"
                     DSHA="$(cat "$WORKSPACE/wazuh-dashboard.sha")"
+                    PSHA="$(cat "$WORKSPACE/wazuh-dashboard-plugins.sha")"
+                    SSHA="$(cat "$WORKSPACE/wazuh-security-dashboards-plugin.sha")"
+                    # The package depends on all three repos, so the cache key combines all three commits
+                    KEY="$(echo "$DSHA" | cut -c1-12)-$(echo "$PSHA" | cut -c1-12)-$(echo "$SSHA" | cut -c1-12)"
+                    if bash "$CACHE_SH" get wazuh-dashboard "$KEY"; then exit 0; fi
 
                     # Reuse the (slow) platform build if the wazuh-dashboard commit has not changed
                     SKIP=0
@@ -163,12 +181,13 @@ pipeline {
 
                     GH="$(dirname "$(cat "$WORKSPACE/wazuh-dashboard.url")")" \
                     DASHBOARD_REF="$DSHA" \
-                    PLUGINS_REF="$(cat "$WORKSPACE/wazuh-dashboard-plugins.sha")" \
-                    SECURITY_REF="$(cat "$WORKSPACE/wazuh-security-dashboards-plugin.sha")" \
+                    PLUGINS_REF="$PSHA" \
+                    SECURITY_REF="$SSHA" \
                     WORKDIR="$D" OUT="$OUT" REVISION="$BUILD_NUMBER" SKIP_PLATFORM="$SKIP" \
                     bash wazuh/build/scripts/build-dashboard.sh
 
                     echo "$DSHA" > "$D/.platform-sha"
+                    bash "$CACHE_SH" put wazuh-dashboard "$KEY" "$OUT"/wazuh-dashboard_*.deb
                 '''
             }
         }

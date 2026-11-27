@@ -77,6 +77,12 @@ run_node() {
         -w /w \
         -e HOME=/tmp/home \
         -e YARN_CACHE_FOLDER=/yarn-cache \
+        -e YARN_NETWORK_TIMEOUT=600000 \
+        -e CYPRESS_INSTALL_BINARY=0 \
+        -e PUPPETEER_SKIP_DOWNLOAD=true \
+        -e PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+        -e CHROMEDRIVER_SKIP_DOWNLOAD=true \
+        -e GECKODRIVER_SKIP_DOWNLOAD=true \
         -e NODE_OPTIONS=--max-old-space-size=6144 \
         -e OPENSEARCH_DASHBOARDS_VERSION="$OSD_VERSION" \
         "node:$NODE" bash -euxc "
