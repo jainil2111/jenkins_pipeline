@@ -26,7 +26,8 @@ case "$cmd" in
             exit 1
         fi
         if [ -f "$dir/.complete" ] && ls "$dir"/*.deb >/dev/null 2>&1; then
-            cp -v "$dir"/*.deb "$OUT/"
+            # Hard link = instant, no extra disk space (same filesystem); fall back to a real copy
+            cp -lv "$dir"/*.deb "$OUT/" 2>/dev/null || cp -v "$dir"/*.deb "$OUT/"
             touch "$dir"                       # mark as recently used
             echo "[cache] $comp: HIT ($key) - reused, build skipped"
             exit 0

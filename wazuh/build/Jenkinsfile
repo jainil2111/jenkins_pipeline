@@ -32,6 +32,7 @@ pipeline {
         SRC = "${WORKSPACE}/src"
         OUT = "${WORKSPACE}/out"
         CACHE_SH = "${WORKSPACE}/wazuh/build/scripts/pkg-cache.sh"   // reuse packages built from the same commit
+        REPO_URL = 'http://192.168.11.20/wazuh-repo'                  // lab apt repo (to skip re-publishing)
     }
 
     stages {
@@ -201,16 +202,36 @@ pipeline {
                     cd "$OUT"
                     [ "$KEEP_DEBUG" = "true" ] || rm -f *-dbg_*.deb
                     rm -f *.sha512
-                    for f in *.deb; do sha512sum "$f" > "$f.sha512"; done
+
+                    # Packages already in the lab repo (e.g. reused from the cache) need no archiving or publishing:
+                    # copying them to Jenkins and back to the repo again took ~20 min per run
+                    LIST="$(mktemp)"
+                    curl -fsS "$REPO_URL/Packages" -o "$LIST" || : > "$LIST"
+                    for f in *.deb; do
+                        [ -e "$f" ] || continue
+                        if grep -qxF "Filename: pool/$f" "$LIST"; then
+                            echo "Already in the repo, skipping archive/publish: $f"
+                            rm -f "$f"
+                        fi
+                    done
+                    rm -f "$LIST"
+
+                    for f in *.deb; do
+                        if [ -e "$f" ]; then sha512sum "$f" > "$f.sha512"; fi
+                    done
                     ls -lh
-                    sha512sum -c *.sha512
+                    if ls *.sha512 >/dev/null 2>&1; then sha512sum -c *.sha512; else echo "No new packages in this run"; fi
                 '''
-                archiveArtifacts artifacts: 'out/*.deb, out/*.sha512', fingerprint: true
+                script {
+                    env.NEW_PKGS = sh(script: 'ls "$OUT"/*.deb 2>/dev/null | wc -l', returnStdout: true).trim()
+                    echo "New packages to archive/publish: ${env.NEW_PKGS}"
+                }
+                archiveArtifacts artifacts: 'out/*.deb, out/*.sha512', fingerprint: true, allowEmptyArchive: true
             }
         }
 
         stage('Publish to repo') {
-            when { expression { params.PUBLISH } }
+            when { expression { params.PUBLISH && env.NEW_PKGS != '0' } }
             agent { label 'built-in' }      // the Jenkins VM, where /srv/wazuh-repo lives
             environment {
                 REPO = '/srv/wazuh-repo'
