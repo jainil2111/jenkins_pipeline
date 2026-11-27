@@ -225,8 +225,12 @@ pipeline {
                 script {
                     env.NEW_PKGS = sh(script: 'ls "$OUT"/*.deb 2>/dev/null | wc -l', returnStdout: true).trim()
                     echo "New packages to archive/publish: ${env.NEW_PKGS}"
+                    // Only call archiveArtifacts when there is something to archive: with zero matches Jenkins
+                    // walks the whole workspace (node_modules, Gradle caches...) which took 18+ minutes
+                    if (env.NEW_PKGS != '0') {
+                        archiveArtifacts artifacts: 'out/*.deb, out/*.sha512', fingerprint: true
+                    }
                 }
-                archiveArtifacts artifacts: 'out/*.deb, out/*.sha512', fingerprint: true, allowEmptyArchive: true
             }
         }
 
