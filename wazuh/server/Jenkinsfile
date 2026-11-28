@@ -2,7 +2,6 @@
 // in the lab apt repo (built by the build-wazuh job).
 // Jenkins job: deploy-wazuh-server   |   Script Path: wazuh/server/Jenkinsfile
 // Needs: Ansible + git on the Jenkins VM, credential "deploy-ssh-key" (user with passwordless sudo on the target)
-
 pipeline {
     agent { label 'built-in' }     // Ansible lives on the Jenkins VM (not on the build VM)
 
@@ -21,8 +20,12 @@ pipeline {
     environment {
         ANSIBLE_HOST_KEY_CHECKING      = 'False'   // lab convenience
         ANSIBLE_CALLBACK_RESULT_FORMAT = 'yaml'
+        ANSIBLE_TIMEOUT                = '30'      // SSH + sudo wait (default 10s is too short for a VM that just woke up)
         ANSIBLE_PIPELINING             = 'True'    // one SSH round-trip per task instead of several
-        ANSIBLE_SSH_ARGS               = '-C -o ControlMaster=auto -o ControlPersist=300s -o GSSAPIAuthentication=no'
+        // Reuse one SSH connection per host within THIS build only (own folder per build), and drop it
+        // fast if the host went away (sleep/reboot) - a stale shared connection makes every job hang.
+        ANSIBLE_SSH_ARGS               = '-C -o ControlMaster=auto -o ControlPersist=60s -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o GSSAPIAuthentication=no'
+        ANSIBLE_SSH_CONTROL_PATH_DIR   = "/tmp/ansible-cp-${env.BUILD_TAG}"
         INVENTORY                      = 'wazuh/ansible/inventory.ini'
         PLATFORM_URL                   = 'https://github.com/jainil2111/wazuh-platform.git'
         LAB_REPO_URL                   = 'http://192.168.11.20/wazuh-repo'
@@ -100,8 +103,11 @@ ansible_python_interpreter=/usr/bin/python3
     }
 
     post {
+        always {
+            sh 'rm -rf "$ANSIBLE_SSH_CONTROL_PATH_DIR" || true'
+        }
         success {
-            echo "Wazuh dashboard: https://${params.WAZUH_SERVER_IP}   (user: admin / password: admin - change it once it works)"
+            echo "Wazuh dashboard: https://${params.WAZUH_SERVER_IP}   (user: admin / password: admin - lab internal)"
         }
     }
 }

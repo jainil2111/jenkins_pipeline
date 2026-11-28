@@ -21,8 +21,12 @@ pipeline {
     environment {
         ANSIBLE_HOST_KEY_CHECKING      = 'False'   // lab convenience
         ANSIBLE_CALLBACK_RESULT_FORMAT = 'yaml'
+        ANSIBLE_TIMEOUT                = '30'      // SSH + sudo wait (default 10s is too short for a VM that just woke up)
         ANSIBLE_PIPELINING             = 'True'    // one SSH round-trip per task
-        ANSIBLE_SSH_ARGS               = '-C -o ControlMaster=auto -o ControlPersist=300s -o GSSAPIAuthentication=no'
+        // Reuse one SSH connection per host within THIS build only (own folder per build), and drop it
+        // fast if the host went away (sleep/reboot) - a stale shared connection makes every job hang.
+        ANSIBLE_SSH_ARGS               = '-C -o ControlMaster=auto -o ControlPersist=60s -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o GSSAPIAuthentication=no'
+        ANSIBLE_SSH_CONTROL_PATH_DIR   = "/tmp/ansible-cp-${env.BUILD_TAG}"
         LAB_REPO_URL                   = 'http://192.168.11.20/wazuh-repo'
         INVENTORY                      = 'wazuh/ansible/inventory.ini'
     }
@@ -90,6 +94,9 @@ ansible_python_interpreter=/usr/bin/python3
     }
 
     post {
+        always {
+            sh 'rm -rf "$ANSIBLE_SSH_CONTROL_PATH_DIR" || true'
+        }
         success {
             echo "Agent '${params.AGENT_NAME}' (${params.WAZUH_AGENT_IP}) is Active on https://${params.WAZUH_SERVER_IP}"
         }

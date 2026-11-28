@@ -24,16 +24,27 @@ pipeline {
         disableConcurrentBuilds()
     }
 
+    // Defaults also apply on the very first run, when Jenkins has not loaded the parameters yet
+    environment {
+        P_PLATFORM_REF = "${params.PLATFORM_REF    ?: 'main'}"
+        P_SERVER_IP    = "${params.WAZUH_SERVER_IP ?: '192.168.11.21'}"
+        P_AGENT_IP     = "${params.WAZUH_AGENT_IP  ?: '192.168.11.22'}"
+        P_AGENT_NAME   = "${params.AGENT_NAME      ?: 'wazuh-agent'}"
+        P_BUILD_JOB    = "${params.BUILD_JOB       ?: 'build-wazuh'}"
+        P_SERVER_JOB   = "${params.SERVER_JOB      ?: 'deploy-wazuh-server'}"
+        P_AGENT_JOB    = "${params.AGENT_JOB       ?: 'deploy-wazuh-agent'}"
+    }
+
     stages {
         stage('Build (only what changed)') {
             steps {
                 script {
-                    def b = build job: params.BUILD_JOB, wait: true, propagate: true, parameters: [
-                        string(name: 'PLATFORM_REF', value: params.PLATFORM_REF),
+                    def b = build job: env.P_BUILD_JOB, wait: true, propagate: true, parameters: [
+                        string(name: 'PLATFORM_REF', value: env.P_PLATFORM_REF),
                         booleanParam(name: 'PUBLISH', value: true)
                     ]
                     env.NEW_PKGS = b.buildVariables.NEW_PKGS ?: '0'
-                    echo "${params.BUILD_JOB} #${b.number}: ${env.NEW_PKGS} new package(s) published"
+                    echo "${env.P_BUILD_JOB} #${b.number}: ${env.NEW_PKGS} new package(s) published"
                 }
             }
         }
@@ -41,10 +52,10 @@ pipeline {
         stage('Deploy server') {
             when { expression { params.FORCE_DEPLOY || params.CLEAN_INSTALL || env.NEW_PKGS != '0' } }
             steps {
-                build job: params.SERVER_JOB, wait: true, propagate: true, parameters: [
-                    string(name: 'WAZUH_SERVER_IP', value: params.WAZUH_SERVER_IP),
-                    string(name: 'PLATFORM_REF',    value: params.PLATFORM_REF),
-                    booleanParam(name: 'CLEAN_INSTALL', value: params.CLEAN_INSTALL)
+                build job: env.P_SERVER_JOB, wait: true, propagate: true, parameters: [
+                    string(name: 'WAZUH_SERVER_IP', value: env.P_SERVER_IP),
+                    string(name: 'PLATFORM_REF',    value: env.P_PLATFORM_REF),
+                    booleanParam(name: 'CLEAN_INSTALL', value: params.CLEAN_INSTALL == true)
                 ]
             }
         }
@@ -53,10 +64,10 @@ pipeline {
         stage('Deploy agent') {
             when { expression { params.FORCE_DEPLOY || params.CLEAN_INSTALL || env.NEW_PKGS != '0' } }
             steps {
-                build job: params.AGENT_JOB, wait: true, propagate: true, parameters: [
-                    string(name: 'WAZUH_SERVER_IP', value: params.WAZUH_SERVER_IP),
-                    string(name: 'WAZUH_AGENT_IP',  value: params.WAZUH_AGENT_IP),
-                    string(name: 'AGENT_NAME',      value: params.AGENT_NAME)
+                build job: env.P_AGENT_JOB, wait: true, propagate: true, parameters: [
+                    string(name: 'WAZUH_SERVER_IP', value: env.P_SERVER_IP),
+                    string(name: 'WAZUH_AGENT_IP',  value: env.P_AGENT_IP),
+                    string(name: 'AGENT_NAME',      value: env.P_AGENT_NAME)
                 ]
             }
         }
@@ -66,17 +77,16 @@ pipeline {
             options { skipDefaultCheckout() }
             steps {
                 sh '''
-                    set -e
-                    IP="$WAZUH_SERVER_IP"
-                    code=$(curl -sk -o /dev/null -w '%{http_code}' "https://$IP/")
+                    IP="$P_SERVER_IP"
+                    code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "https://$IP/" || true)
                     echo "Dashboard https://$IP -> HTTP $code"
                     case "$code" in 200|302) ;; *) echo "Dashboard not answering"; exit 1;; esac
 
-                    health=$(curl -sk -u admin:admin "https://$IP:9200/_cluster/health" | sed -n 's/.*"status":"\\([a-z]*\\)".*/\\1/p')
+                    health=$(curl -sk --max-time 15 -u admin:admin "https://$IP:9200/_cluster/health" | sed -n 's/.*"status":"\\([a-z]*\\)".*/\\1/p')
                     echo "Indexer cluster health: $health"
                     case "$health" in green|yellow) ;; *) echo "Indexer unhealthy"; exit 1;; esac
 
-                    alerts=$(curl -sk -u admin:admin "https://$IP:9200/wazuh-alerts-*/_count" | sed -n 's/.*"count":\\([0-9]*\\).*/\\1/p')
+                    alerts=$(curl -sk --max-time 15 -u admin:admin "https://$IP:9200/wazuh-alerts-*/_count" | sed -n 's/.*"count":\\([0-9]*\\).*/\\1/p')
                     echo "Alerts stored so far: ${alerts:-0}"
                     [ "${alerts:-0}" -gt 0 ] || echo "WARNING: no alerts yet (normal for a few minutes after a clean install)"
                 '''
@@ -85,6 +95,6 @@ pipeline {
     }
 
     post {
-        success { echo "Wazuh is up: https://${params.WAZUH_SERVER_IP}  (admin / admin)" }
+        success { echo "Wazuh is up: https://${env.P_SERVER_IP}  (admin / admin)" }
     }
 }

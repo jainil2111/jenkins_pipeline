@@ -27,14 +27,9 @@
     indexer_node: node-1
     server_node: wazuh-1
     dashboard_node: dashboard
-    # Default credentials of a step-by-step install (to be replaced by strong passwords later)
+    # Default credentials of a step-by-step install (lab-internal only)
     indexer_user: admin
     indexer_password: admin
-    # Not one of your forks: Elastic's Filebeat OSS build and Wazuh's Filebeat module, as in the official guide
-    filebeat_deb_url: "https://packages.wazuh.com/4.x/apt/pool/main/f/filebeat/filebeat-oss-7.10.2-amd64.deb"
-    filebeat_yml_url: "https://packages.wazuh.com/4.14/tpl/wazuh/filebeat/filebeat.yml"
-    filebeat_module_url: "https://packages.wazuh.com/4.x/filebeat/wazuh-filebeat-0.5.tar.gz"
-    wazuh_template_fallback_url: "https://raw.githubusercontent.com/wazuh/wazuh/v4.14.10/extensions/elasticsearch/7.x/wazuh-template.json"
     certs_dir: /root/wazuh-certs
     staging: /root/wazuh-staging   # kept across clean installs: the Filebeat .deb is downloaded only once
     apt_env:
@@ -54,39 +49,34 @@
         fail_msg: "Only {{ free_gb.stdout }} GB free on / - need at least {{ min_free_gb }} GB. Grow the disk first."
         success_msg: "{{ free_gb.stdout }} GB free on /"
 
-    - name: Clean install - stop services
-      ansible.builtin.systemd:
-        name: "{{ item }}"
-        state: stopped
-      loop: [wazuh-dashboard, filebeat, wazuh-manager, wazuh-indexer]
-      failed_when: false
+    # Fast wipe: stop everything at once, delete the big folders with rm -rf (seconds), THEN purge -
+    # dpkg then has almost nothing left to delete. (Purging first walks ~50k files one by one: ~3 min.)
+    - name: Clean install - stop all services at once and kill leftovers
+      ansible.builtin.shell: |
+        systemctl stop wazuh-dashboard filebeat wazuh-manager wazuh-indexer 2>/dev/null || true
+        pkill -9 -u wazuh-indexer 2>/dev/null; pkill -9 -u wazuh-dashboard 2>/dev/null
+        pkill -9 -f '^/var/ossec/' 2>/dev/null; pkill -9 -x filebeat 2>/dev/null
+        true
       when: clean_install | bool
 
-    - name: Clean install - purge packages
-      ansible.builtin.apt:
-        name: [wazuh-dashboard, filebeat, wazuh-manager, wazuh-indexer]
-        state: absent
-        purge: true
+    - name: Clean install - delete data, config and program folders
+      ansible.builtin.shell: >
+        rm -rf /var/lib/wazuh-indexer /usr/share/wazuh-indexer /etc/wazuh-indexer
+        /var/ossec /etc/filebeat /var/lib/filebeat /usr/share/filebeat
+        /etc/wazuh-dashboard /usr/share/wazuh-dashboard /var/lib/wazuh-dashboard
+        {{ certs_dir }} /root/.wazuh-indexer-initialized
+      when: clean_install | bool
+
+    - name: Clean install - purge the packages (now quick)
+      ansible.builtin.shell: |
+        PKGS=$(dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' wazuh-dashboard filebeat wazuh-manager wazuh-indexer 2>/dev/null | awk '$2 ~ /^[ihr]/ {print $1}')
+        [ -z "$PKGS" ] && { echo "nothing installed"; exit 0; }
+        # removal scripts may look for programs we already deleted: fall back to a forced purge
+        apt-get purge -y -q $PKGS || dpkg --purge --force-all $PKGS
+        LEFT=$(dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' $PKGS 2>/dev/null | awk '$2 !~ /^[up]n/ {print $1}')
+        [ -z "$LEFT" ] || { echo "still installed: $LEFT"; exit 1; }
+        echo "purged: $PKGS"
       environment: "{{ apt_env }}"
-      when: clean_install | bool
-
-    - name: Clean install - remove leftover data and config
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /var/lib/wazuh-indexer
-        - /usr/share/wazuh-indexer
-        - /etc/wazuh-indexer
-        - /var/ossec
-        - /etc/filebeat
-        - /var/lib/filebeat
-        - /usr/share/filebeat
-        - /etc/wazuh-dashboard
-        - /usr/share/wazuh-dashboard
-        - /var/lib/wazuh-dashboard
-        - "{{ certs_dir }}"
-        - /root/.wazuh-indexer-initialized
       when: clean_install | bool
 
     # ------------------------------------------------------------------ 1. faster package installs
@@ -313,15 +303,14 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
-    - name: Start wazuh-indexer and wazuh-manager together
+    # Start order matters for speed: on a fresh install the manager immediately downloads and unpacks
+    # its vulnerability database (~11 GB, all CPU). Starting it LAST keeps the indexer, Filebeat and
+    # dashboard fast; the database then loads in the background.
+    - name: Start wazuh-indexer
       ansible.builtin.systemd:
-        name: "{{ item }}"
+        name: wazuh-indexer
         state: restarted
         enabled: true
-      loop: [wazuh-indexer, wazuh-manager]
-      async: 600
-      poll: 0
-      register: core_start
 
     - name: Wait for the indexer port
       ansible.builtin.wait_for:
@@ -357,10 +346,10 @@
       poll: 0
       register: edge_start
 
-    - name: Confirm all four services started
+    - name: Confirm Filebeat and the dashboard started
       ansible.builtin.async_status:
         jid: "{{ item.ansible_job_id }}"
-      loop: "{{ core_start.results + edge_start.results }}"
+      loop: "{{ edge_start.results }}"
       loop_control:
         label: "{{ item.item }}"
       register: start_jobs
@@ -376,11 +365,44 @@
       delay: 10
       until: fb_test.rc == 0
 
-    - name: Wait for the dashboard port
+    - name: Wait for the dashboard
+      block:
+        - name: Wait for the dashboard port
+          ansible.builtin.wait_for:
+            host: "{{ node_ip }}"
+            port: 443
+            timeout: 300
+      rescue:
+        - name: Dashboard did not come up - collect its state
+          ansible.builtin.shell: |
+            echo "== service: $(systemctl is-active wazuh-dashboard)  restarts: $(systemctl show -p NRestarts --value wazuh-dashboard)"
+            echo "== load: $(cut -d' ' -f1-3 /proc/loadavg)   mem: $(free -h | awk '/Mem/{print $7" available of "$2}')   disk: $(df -h / | awk 'NR==2{print $4" free"}')"
+            echo "== listening:"; ss -ltnp | grep -E ':(443|5601|9200|55000) ' || true
+            echo "== top CPU:"; ps -eo pcpu,pmem,comm --sort=-pcpu | head -6
+            echo "== dashboard log (last 40 lines):"; journalctl -u wazuh-dashboard --no-pager -n 40 -o cat
+          register: dash_diag
+          changed_when: false
+
+        - name: Dashboard diagnostics
+          ansible.builtin.debug:
+            msg: "{{ dash_diag.stdout_lines }}"
+
+        - name: Fail with the reason above
+          ansible.builtin.fail:
+            msg: "wazuh-dashboard did not open port 443 within 5 minutes - see 'Dashboard diagnostics' above"
+
+    - name: Start wazuh-manager last (its vulnerability database then loads in the background)
+      ansible.builtin.systemd:
+        name: wazuh-manager
+        state: restarted
+        enabled: true
+
+    - name: Wait for the manager - agent enrollment (1515) and API (55000)
       ansible.builtin.wait_for:
         host: "{{ node_ip }}"
-        port: 443
+        port: "{{ item }}"
         timeout: 300
+      loop: [1515, 55000]
 
     # ------------------------------------------------------------------ 6. summary
     - name: Installed versions and template source
