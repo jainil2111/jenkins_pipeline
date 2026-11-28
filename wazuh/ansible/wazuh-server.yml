@@ -30,6 +30,11 @@
     # Default credentials of a step-by-step install (lab-internal only)
     indexer_user: admin
     indexer_password: admin
+    # Not one of your forks: Elastic's Filebeat OSS build and Wazuh's Filebeat module, as in the official guide
+    filebeat_deb_url: "https://packages.wazuh.com/4.x/apt/pool/main/f/filebeat/filebeat-oss-7.10.2-amd64.deb"
+    filebeat_yml_url: "https://packages.wazuh.com/4.14/tpl/wazuh/filebeat/filebeat.yml"
+    filebeat_module_url: "https://packages.wazuh.com/4.x/filebeat/wazuh-filebeat-0.5.tar.gz"
+    wazuh_template_fallback_url: "https://raw.githubusercontent.com/wazuh/wazuh/v4.14.10/extensions/elasticsearch/7.x/wazuh-template.json"
     certs_dir: /root/wazuh-certs
     staging: /root/wazuh-staging   # kept across clean installs: the Filebeat .deb is downloaded only once
     apt_env:
@@ -307,6 +312,20 @@
                 run_as: true
 
     # ------------------------------------------------------------------ 5. start (in parallel where possible)
+    - name: Folders for the systemd start-timeout overrides
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ item }}.service.d"
+        state: directory
+        mode: "0755"
+      loop: [wazuh-indexer, wazuh-manager]
+
+    - name: Give the indexer and manager up to 10 minutes to start (default ~90s is too short on a busy host)
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item }}.service.d/lab-timeout.conf"
+        content: "[Service]\nTimeoutStartSec=600\n"
+        mode: "0644"
+      loop: [wazuh-indexer, wazuh-manager]
+
     - name: Reload systemd units
       ansible.builtin.systemd:
         daemon_reload: true
