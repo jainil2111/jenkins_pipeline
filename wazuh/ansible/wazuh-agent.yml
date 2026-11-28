@@ -1,68 +1,78 @@
+# Installs YOUR wazuh-agent (built by build-wazuh, published to the lab repo) and enrolls it.
+#
+# Enrollment is self-healing: the play first asks the manager which agents it knows. If this agent's
+# name is missing (e.g. the server was rebuilt), the agent's old key is wiped so it enrolls again.
 ---
-# Installs the Wazuh agent pinned to the manager's exact version (an agent must
-# never be newer than its manager) and enrolls it with the manager.
-- name: Read Wazuh manager version
+- name: Ask the manager which agents it already knows
   hosts: wazuh_server
   become: true
   gather_facts: false
   tasks:
-    - name: Get manager version
-      ansible.builtin.command: /var/ossec/bin/wazuh-control info -v
-      register: mgr_ver
+    - name: Registered agent names on the manager
+      ansible.builtin.shell: >-
+        /var/ossec/bin/manage_agents -l | sed -n 's/.*Name: \([^,]*\),.*/\1/p'
+      register: registered
       changed_when: false
 
-    - name: Store version (e.g. 4.14.1)
-      ansible.builtin.set_fact:
-        wazuh_manager_version: "{{ mgr_ver.stdout | trim | regex_replace('^v', '') }}"
-
-- name: Install and enroll Wazuh agent
+- name: Install and enroll Wazuh agent from the lab repo
   hosts: wazuh_agents
   become: true
+  gather_facts: false
   vars:
     manager_host: "{{ groups['wazuh_server'][0] }}"
     manager_ip: "{{ hostvars[manager_host].ansible_host }}"
-    agent_version: "{{ hostvars[manager_host].wazuh_manager_version }}"
     agent_name: "{{ inventory_hostname }}"
+    lab_repo_url: "http://192.168.11.20/wazuh-repo"
+    known_on_manager: "{{ agent_name in hostvars[manager_host].registered.stdout_lines }}"
+    apt_env:
+      NEEDRESTART_SUSPEND: "1"
+      DEBIAN_FRONTEND: noninteractive
 
   tasks:
-    - name: Install prerequisites
-      ansible.builtin.apt:
-        name: [curl, gnupg, apt-transport-https]
-        state: present
-        update_cache: true
-        cache_valid_time: 3600
+    - name: Faster installs - dpkg skips fsync, no man-db rebuild
+      ansible.builtin.shell: |
+        echo force-unsafe-io > /etc/dpkg/dpkg.cfg.d/99-lab-unsafe-io
+        echo 'man-db man-db/auto-update boolean false' | debconf-set-selections
+      changed_when: false
 
-    - name: Import Wazuh GPG key
-      ansible.builtin.shell: >
-        curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH
-        | gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import
-      args:
-        creates: /usr/share/keyrings/wazuh.gpg
-
-    - name: Make keyring readable by apt
+    - name: Remove the official Wazuh repo if an older run added it
       ansible.builtin.file:
-        path: /usr/share/keyrings/wazuh.gpg
-        mode: "0644"
+        path: /etc/apt/sources.list.d/wazuh.list
+        state: absent
 
-    - name: Add Wazuh apt repository
+    - name: Add lab apt repo (packages built by build-wazuh)
       ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/wazuh.list
-        content: "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main\n"
+        dest: /etc/apt/sources.list.d/wazuh-lab.list
+        content: "deb [trusted=yes] {{ lab_repo_url }}/ ./\n"
         mode: "0644"
-      register: wazuh_repo
 
     - name: Refresh apt cache
       ansible.builtin.apt:
         update_cache: true
-      when: wazuh_repo.changed
 
-    - name: Install wazuh-agent {{ agent_version }}
+    - name: Find newest wazuh-agent in the lab repo
+      ansible.builtin.shell: >
+        apt-cache madison wazuh-agent | awk -v r="{{ lab_repo_url | regex_replace('^https?://', '') }}" '$0 ~ r {print $3; exit}'
+      register: lab_agent
+      changed_when: false
+
+    - name: Fail if the lab repo has no agent package
+      ansible.builtin.fail:
+        msg: "No wazuh-agent found in {{ lab_repo_url }}. Run build-wazuh with BUILD_AGENT + PUBLISH first."
+      when: lab_agent.stdout | length == 0
+
+    - name: Release any old hold on wazuh-agent
+      ansible.builtin.dpkg_selections:
+        name: wazuh-agent
+        selection: install
+      failed_when: false
+
+    - name: Install YOUR wazuh-agent {{ lab_agent.stdout }}
       ansible.builtin.apt:
-        name: "wazuh-agent={{ agent_version }}-1"
+        name: "wazuh-agent={{ lab_agent.stdout }}"
         state: present
-      environment:
-        WAZUH_MANAGER: "{{ manager_ip }}"
-        WAZUH_AGENT_NAME: "{{ agent_name }}"
+        allow_downgrade: true
+      environment: "{{ apt_env | combine({'WAZUH_MANAGER': manager_ip, 'WAZUH_AGENT_NAME': agent_name}) }}"
       notify: Restart wazuh-agent
 
     - name: Point agent at the manager (also fixes re-runs with a new server IP)
@@ -72,10 +82,28 @@
         replace: '<address>{{ manager_ip }}</address>'
       notify: Restart wazuh-agent
 
-    - name: Hold wazuh-agent so apt upgrade can't move it past the manager
-      ansible.builtin.dpkg_selections:
-        name: wazuh-agent
-        selection: hold
+    - name: Set the enrollment name
+      ansible.builtin.shell: |
+        grep -q '<agent_name>' /var/ossec/etc/ossec.conf && \
+          sed -i 's#<agent_name>.*</agent_name>#<agent_name>{{ agent_name }}</agent_name>#' /var/ossec/etc/ossec.conf || \
+          sed -i '0,/<\/server>/s##</server>\n    <enrollment>\n      <agent_name>{{ agent_name }}</agent_name>\n    </enrollment>#' /var/ossec/etc/ossec.conf
+        grep -c '<agent_name>{{ agent_name }}</agent_name>' /var/ossec/etc/ossec.conf
+      register: name_set
+      changed_when: false
+
+    - name: Manager does not know this agent - wipe the old key so it enrolls again
+      ansible.builtin.copy:
+        dest: /var/ossec/etc/client.keys
+        content: ""
+        owner: root
+        group: wazuh
+        mode: "0640"
+      when: not known_on_manager
+      notify: Restart wazuh-agent
+
+    - name: Enrollment status
+      ansible.builtin.debug:
+        msg: "{{ agent_name }} is {{ 'already registered' if known_on_manager else 'new to this manager - enrolling' }}"
 
     - name: Enable and start wazuh-agent
       ansible.builtin.systemd:
@@ -83,6 +111,18 @@
         daemon_reload: true
         enabled: true
         state: started
+
+    - name: Apply pending restarts now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Show installed agent package
+      ansible.builtin.command: dpkg-query -W -f='${Package} ${Version}\n' wazuh-agent
+      register: agent_pkg
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "Installed {{ agent_pkg.stdout | trim }} on {{ inventory_hostname }} -> manager {{ manager_ip }}"
 
   handlers:
     - name: Restart wazuh-agent

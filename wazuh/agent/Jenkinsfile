@@ -1,24 +1,29 @@
 // Installs a Wazuh agent on an Ubuntu VM and enrolls it with an existing Wazuh server.
-// Jenkins job: wazuh-agent   |   Script Path: wazuh/agent/Jenkinsfile
-// Run the wazuh-server job first. Re-run this job once per machine you want to monitor.
+// Jenkins job: deploy-wazuh-agent   |   Script Path: wazuh/agent/Jenkinsfile
+// Run deploy-wazuh-server first. Re-run this job once per machine you want to monitor.
+// Re-enrolls automatically when the server was rebuilt (the manager no longer knows the agent).
 
 pipeline {
-    agent any
+    agent { label 'built-in' }     // Ansible lives on the Jenkins VM (not on the build VM)
 
     parameters {
         string(name: 'WAZUH_SERVER_IP', defaultValue: '192.168.11.21', description: 'IP of the existing Wazuh server')
         string(name: 'WAZUH_AGENT_IP',  defaultValue: '192.168.11.22', description: 'IP of the machine to install the agent on')
-        string(name: 'AGENT_NAME',      defaultValue: 'wazuh-agent',   description: 'Name the agent registers with (unique, no spaces)')
+        string(name: 'AGENT_NAME',      defaultValue: 'wazuh-agent',   description: 'Name the agent registers with on the manager (unique, no spaces)')
     }
 
     options {
         timestamps()
         timeout(time: 20, unit: 'MINUTES')
+        disableConcurrentBuilds()
     }
 
     environment {
         ANSIBLE_HOST_KEY_CHECKING      = 'False'   // lab convenience
         ANSIBLE_CALLBACK_RESULT_FORMAT = 'yaml'
+        ANSIBLE_PIPELINING             = 'True'    // one SSH round-trip per task
+        ANSIBLE_SSH_ARGS               = '-C -o ControlMaster=auto -o ControlPersist=300s -o GSSAPIAuthentication=no'
+        LAB_REPO_URL                   = 'http://192.168.11.20/wazuh-repo'
         INVENTORY                      = 'wazuh/ansible/inventory.ini'
     }
 
@@ -68,7 +73,7 @@ ansible_python_interpreter=/usr/bin/python3
                 withCredentials([sshUserPrivateKey(credentialsId: 'deploy-ssh-key',
                                                    keyFileVariable: 'SSH_KEY',
                                                    usernameVariable: 'SSH_USER')]) {
-                    sh 'ansible-playbook -i "$INVENTORY" wazuh/ansible/wazuh-agent.yml -u "$SSH_USER" --private-key "$SSH_KEY"'
+                    sh 'ansible-playbook -i "$INVENTORY" wazuh/ansible/wazuh-agent.yml -u "$SSH_USER" --private-key "$SSH_KEY" -e lab_repo_url="$LAB_REPO_URL"'
                 }
             }
         }
