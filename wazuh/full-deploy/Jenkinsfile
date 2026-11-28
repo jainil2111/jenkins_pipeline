@@ -1,0 +1,90 @@
+// One click: build YOUR Wazuh from the pinned forks -> deploy server -> deploy agent -> health check.
+// Jenkins job: wazuh-full-deploy   |   Script Path: wazuh/full-deploy/Jenkinsfile
+// Only orchestrates the existing jobs (build-wazuh, deploy-wazuh-server, deploy-wazuh-agent).
+// Deploys only when the build produced new packages, unless FORCE_DEPLOY is ticked.
+
+pipeline {
+    agent none      // holds no executor while waiting on the other jobs (avoids deadlock on a 1-executor node)
+
+    parameters {
+        string(name: 'PLATFORM_REF',    defaultValue: 'main',          description: 'wazuh-platform branch/commit: decides which fork commits get built')
+        string(name: 'WAZUH_SERVER_IP', defaultValue: '192.168.11.21', description: 'Wazuh server VM')
+        string(name: 'WAZUH_AGENT_IP',  defaultValue: '192.168.11.22', description: 'Wazuh agent VM')
+        string(name: 'AGENT_NAME',      defaultValue: 'wazuh-agent',   description: 'Agent name on the manager')
+        booleanParam(name: 'FORCE_DEPLOY',  defaultValue: false, description: 'Deploy even if the build produced no new packages')
+        booleanParam(name: 'CLEAN_INSTALL', defaultValue: false, description: 'DESTRUCTIVE: wipe the server install first')
+        string(name: 'BUILD_JOB',  defaultValue: 'build-wazuh',         description: 'Name of the build job')
+        string(name: 'SERVER_JOB', defaultValue: 'deploy-wazuh-server', description: 'Name of the server deploy job')
+        string(name: 'AGENT_JOB',  defaultValue: 'deploy-wazuh-agent',  description: 'Name of the agent deploy job')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 4, unit: 'HOURS')     // a full rebuild of every component is the worst case
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Build (only what changed)') {
+            steps {
+                script {
+                    def b = build job: params.BUILD_JOB, wait: true, propagate: true, parameters: [
+                        string(name: 'PLATFORM_REF', value: params.PLATFORM_REF),
+                        booleanParam(name: 'PUBLISH', value: true)
+                    ]
+                    env.NEW_PKGS = b.buildVariables.NEW_PKGS ?: '0'
+                    echo "${params.BUILD_JOB} #${b.number}: ${env.NEW_PKGS} new package(s) published"
+                }
+            }
+        }
+
+        stage('Deploy server') {
+            when { expression { params.FORCE_DEPLOY || params.CLEAN_INSTALL || env.NEW_PKGS != '0' } }
+            steps {
+                build job: params.SERVER_JOB, wait: true, propagate: true, parameters: [
+                    string(name: 'WAZUH_SERVER_IP', value: params.WAZUH_SERVER_IP),
+                    string(name: 'PLATFORM_REF',    value: params.PLATFORM_REF),
+                    booleanParam(name: 'CLEAN_INSTALL', value: params.CLEAN_INSTALL)
+                ]
+            }
+        }
+
+        // After the server: the agent enrolls with it. The agent job also verifies "Active".
+        stage('Deploy agent') {
+            when { expression { params.FORCE_DEPLOY || params.CLEAN_INSTALL || env.NEW_PKGS != '0' } }
+            steps {
+                build job: params.AGENT_JOB, wait: true, propagate: true, parameters: [
+                    string(name: 'WAZUH_SERVER_IP', value: params.WAZUH_SERVER_IP),
+                    string(name: 'WAZUH_AGENT_IP',  value: params.WAZUH_AGENT_IP),
+                    string(name: 'AGENT_NAME',      value: params.AGENT_NAME)
+                ]
+            }
+        }
+
+        stage('Health check') {
+            agent { label 'built-in' }
+            options { skipDefaultCheckout() }
+            steps {
+                sh '''
+                    set -e
+                    IP="$WAZUH_SERVER_IP"
+                    code=$(curl -sk -o /dev/null -w '%{http_code}' "https://$IP/")
+                    echo "Dashboard https://$IP -> HTTP $code"
+                    case "$code" in 200|302) ;; *) echo "Dashboard not answering"; exit 1;; esac
+
+                    health=$(curl -sk -u admin:admin "https://$IP:9200/_cluster/health" | sed -n 's/.*"status":"\\([a-z]*\\)".*/\\1/p')
+                    echo "Indexer cluster health: $health"
+                    case "$health" in green|yellow) ;; *) echo "Indexer unhealthy"; exit 1;; esac
+
+                    alerts=$(curl -sk -u admin:admin "https://$IP:9200/wazuh-alerts-*/_count" | sed -n 's/.*"count":\\([0-9]*\\).*/\\1/p')
+                    echo "Alerts stored so far: ${alerts:-0}"
+                    [ "${alerts:-0}" -gt 0 ] || echo "WARNING: no alerts yet (normal for a few minutes after a clean install)"
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "Wazuh is up: https://${params.WAZUH_SERVER_IP}  (admin / admin)" }
+    }
+}
