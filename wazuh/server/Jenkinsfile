@@ -21,6 +21,8 @@ pipeline {
     environment {
         ANSIBLE_HOST_KEY_CHECKING      = 'False'   // lab convenience
         ANSIBLE_CALLBACK_RESULT_FORMAT = 'yaml'
+        ANSIBLE_PIPELINING             = 'True'    // one SSH round-trip per task instead of several
+        ANSIBLE_SSH_ARGS               = '-C -o ControlMaster=auto -o ControlPersist=300s -o GSSAPIAuthentication=no'
         INVENTORY                      = 'wazuh/ansible/inventory.ini'
         PLATFORM_URL                   = 'https://github.com/jainil2111/wazuh-platform.git'
         LAB_REPO_URL                   = 'http://192.168.11.20/wazuh-repo'

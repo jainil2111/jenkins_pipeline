@@ -1,6 +1,13 @@
 # Installs an all-in-one Wazuh server (indexer + manager + Filebeat + dashboard) from YOUR packages
 # in the lab apt repo, following the official Wazuh 4.14 step-by-step installation.
 #
+# Speed layout (dpkg allows only one install at a time, so installs are batched; everything else overlaps):
+#   1. Internet downloads (Filebeat, its module, filebeat.yml, alerts template) run in the BACKGROUND
+#      while apt installs indexer + manager + dashboard in ONE transaction from the lab repo.
+#   2. All configuration is written before any service starts (no CPU fight with a running manager).
+#   3. Indexer and manager start TOGETHER; Filebeat and dashboard start TOGETHER.
+#   Plus: dpkg force-unsafe-io, no man-db / needrestart scans, no fact gathering.
+#
 # Variables (passed by the deploy-wazuh-server Jenkins job):
 #   lab_repo_url          lab apt repo                         (default http://192.168.11.20/wazuh-repo)
 #   wazuh_template_url    wazuh-template.json from YOUR wazuh fork at the pinned commit
@@ -9,11 +16,13 @@
 - name: Deploy Wazuh all-in-one server from the lab repo
   hosts: wazuh_server
   become: true
+  gather_facts: false            # nothing below uses facts; saves a round of probing
 
   vars:
     node_ip: "{{ ansible_host }}"
     lab_repo_url: "http://192.168.11.20/wazuh-repo"
     clean_install: false
+    min_free_gb: 15              # the manager's vulnerability database alone needs ~11 GB
     # Node names used in the certificates (must match config.yml below)
     indexer_node: node-1
     server_node: wazuh-1
@@ -27,9 +36,24 @@
     filebeat_module_url: "https://packages.wazuh.com/4.x/filebeat/wazuh-filebeat-0.5.tar.gz"
     wazuh_template_fallback_url: "https://raw.githubusercontent.com/wazuh/wazuh/v4.14.10/extensions/elasticsearch/7.x/wazuh-template.json"
     certs_dir: /root/wazuh-certs
+    staging: /root/wazuh-staging   # kept across clean installs: the Filebeat .deb is downloaded only once
+    apt_env:
+      NEEDRESTART_SUSPEND: "1"     # skip the slow "which services need restarting" scan after each install
+      DEBIAN_FRONTEND: noninteractive
 
   tasks:
-    # ------------------------------------------------------------------ 0. optional clean-up
+    # ------------------------------------------------------------------ 0. pre-checks + optional clean-up
+    - name: Check free disk space
+      ansible.builtin.shell: df --output=avail -BG / | tail -1 | tr -dc '0-9'
+      register: free_gb
+      changed_when: false
+
+    - name: Stop early if the disk is too small
+      ansible.builtin.assert:
+        that: free_gb.stdout | int >= min_free_gb
+        fail_msg: "Only {{ free_gb.stdout }} GB free on / - need at least {{ min_free_gb }} GB. Grow the disk first."
+        success_msg: "{{ free_gb.stdout }} GB free on /"
+
     - name: Clean install - stop services
       ansible.builtin.systemd:
         name: "{{ item }}"
@@ -43,6 +67,7 @@
         name: [wazuh-dashboard, filebeat, wazuh-manager, wazuh-indexer]
         state: absent
         purge: true
+      environment: "{{ apt_env }}"
       when: clean_install | bool
 
     - name: Clean install - remove leftover data and config
@@ -64,12 +89,16 @@
         - /root/.wazuh-indexer-initialized
       when: clean_install | bool
 
-    # ------------------------------------------------------------------ 1. prerequisites + lab repo
-    - name: Install prerequisites
-      ansible.builtin.apt:
-        name: [debhelper, tar, curl, libcap2-bin, gnupg, apt-transport-https]
-        state: present
-        update_cache: true
+    # ------------------------------------------------------------------ 1. faster package installs
+    - name: dpkg - skip fsync on every file (big win for the dashboard's ~50k files)
+      ansible.builtin.copy:
+        dest: /etc/dpkg/dpkg.cfg.d/99-lab-unsafe-io
+        content: "force-unsafe-io\n"
+        mode: "0644"
+
+    - name: Skip man-db index rebuilds after installs
+      ansible.builtin.shell: echo 'man-db man-db/auto-update boolean false' | debconf-set-selections
+      changed_when: false
 
     - name: Add the lab apt repo (your own packages)
       ansible.builtin.copy:
@@ -77,13 +106,58 @@
         content: "deb [trusted=yes] {{ lab_repo_url }}/ ./\n"
         mode: "0644"
 
-    # ------------------------------------------------------------------ 2. indexer + certificates
-    - name: Install wazuh-indexer from the lab repo (newest)
-      ansible.builtin.apt:
-        name: wazuh-indexer
-        state: latest
-        update_cache: true
+    # ------------------------------------------------------------------ 2. downloads (background) + installs
+    - name: Create the download folder
+      ansible.builtin.file:
+        path: "{{ staging }}"
+        state: directory
+        mode: "0700"
 
+    - name: Background - download Filebeat, its module, filebeat.yml and the alerts template
+      ansible.builtin.shell: |
+        set -e
+        cd {{ staging }}
+        get() { curl -fsSL --retry 3 --connect-timeout 15 -o "$2.tmp" "$1" && mv "$2.tmp" "$2"; }
+        [ -s filebeat.deb ]       || get "{{ filebeat_deb_url }}"    filebeat.deb
+        [ -s filebeat-module.tgz ] || get "{{ filebeat_module_url }}" filebeat-module.tgz
+        get "{{ filebeat_yml_url }}" filebeat.yml
+        if get "{{ wazuh_template_url | default(wazuh_template_fallback_url) }}" wazuh-template.json; then
+          echo "fork (pinned commit)" > template.source
+        else
+          get "{{ wazuh_template_fallback_url }}" wazuh-template.json
+          echo "official v4.14.10 fallback" > template.source
+        fi
+      async: 900
+      poll: 0
+      register: downloads
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name: [tar, curl, libcap2-bin, debconf, adduser, procps]
+        state: present
+        update_cache: true
+      environment: "{{ apt_env }}"
+
+    - name: Install wazuh-indexer, wazuh-manager and wazuh-dashboard from the lab repo (one transaction)
+      ansible.builtin.apt:
+        name: [wazuh-indexer, wazuh-manager, wazuh-dashboard]
+        state: latest
+      environment: "{{ apt_env }}"
+
+    - name: Wait for the background downloads
+      ansible.builtin.async_status:
+        jid: "{{ downloads.ansible_job_id }}"
+      register: downloads_job
+      until: downloads_job.finished
+      retries: 90
+      delay: 10
+
+    - name: Install Filebeat
+      ansible.builtin.apt:
+        deb: "{{ staging }}/filebeat.deb"
+      environment: "{{ apt_env }}"
+
+    # ------------------------------------------------------------------ 3. certificates
     - name: Create the certificates working folder
       ansible.builtin.file:
         path: "{{ certs_dir }}"
@@ -119,7 +193,41 @@
         chdir: "{{ certs_dir }}"
         creates: "{{ certs_dir }}/wazuh-certificates/root-ca.pem"
 
-    - name: Configure opensearch.yml - node address and name
+    - name: Create the certs folders
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.owner }}"
+        mode: "0500"
+      loop:
+        - { path: /etc/wazuh-indexer/certs,   owner: wazuh-indexer }
+        - { path: /etc/filebeat/certs,        owner: root }
+        - { path: /etc/wazuh-dashboard/certs, owner: wazuh-dashboard }
+
+    - name: Deploy certificates (indexer, Filebeat, dashboard)
+      ansible.builtin.copy:
+        src: "{{ certs_dir }}/wazuh-certificates/{{ item.src }}"
+        dest: "{{ item.dir }}/{{ item.dest }}"
+        remote_src: true
+        owner: "{{ item.owner }}"
+        group: "{{ item.owner }}"
+        mode: "0400"
+      loop:
+        - { dir: /etc/wazuh-indexer/certs,   owner: wazuh-indexer,   src: "{{ indexer_node }}.pem",       dest: indexer.pem }
+        - { dir: /etc/wazuh-indexer/certs,   owner: wazuh-indexer,   src: "{{ indexer_node }}-key.pem",   dest: indexer-key.pem }
+        - { dir: /etc/wazuh-indexer/certs,   owner: wazuh-indexer,   src: admin.pem,                      dest: admin.pem }
+        - { dir: /etc/wazuh-indexer/certs,   owner: wazuh-indexer,   src: admin-key.pem,                  dest: admin-key.pem }
+        - { dir: /etc/wazuh-indexer/certs,   owner: wazuh-indexer,   src: root-ca.pem,                    dest: root-ca.pem }
+        - { dir: /etc/filebeat/certs,        owner: root,            src: "{{ server_node }}.pem",        dest: filebeat.pem }
+        - { dir: /etc/filebeat/certs,        owner: root,            src: "{{ server_node }}-key.pem",    dest: filebeat-key.pem }
+        - { dir: /etc/filebeat/certs,        owner: root,            src: root-ca.pem,                    dest: root-ca.pem }
+        - { dir: /etc/wazuh-dashboard/certs, owner: wazuh-dashboard, src: "{{ dashboard_node }}.pem",     dest: dashboard.pem }
+        - { dir: /etc/wazuh-dashboard/certs, owner: wazuh-dashboard, src: "{{ dashboard_node }}-key.pem", dest: dashboard-key.pem }
+        - { dir: /etc/wazuh-dashboard/certs, owner: wazuh-dashboard, src: root-ca.pem,                    dest: root-ca.pem }
+
+    # ------------------------------------------------------------------ 4. configuration (nothing running yet)
+    - name: Indexer - node address and name
       ansible.builtin.lineinfile:
         path: /etc/wazuh-indexer/opensearch.yml
         regexp: "{{ item.re }}"
@@ -128,35 +236,92 @@
         - { re: '^network\.host:', line: 'network.host: "{{ node_ip }}"' }
         - { re: '^node\.name:',    line: 'node.name: "{{ indexer_node }}"' }
 
-    - name: Create the indexer certs folder
-      ansible.builtin.file:
-        path: /etc/wazuh-indexer/certs
-        state: directory
-        owner: wazuh-indexer
-        group: wazuh-indexer
-        mode: "0500"
+    - name: Manager - indexer credentials in the keystore
+      ansible.builtin.shell: |
+        echo '{{ indexer_user }}'     | /var/ossec/bin/wazuh-keystore -f indexer -k username
+        echo '{{ indexer_password }}' | /var/ossec/bin/wazuh-keystore -f indexer -k password
+      no_log: true
+      changed_when: false
 
-    - name: Deploy indexer certificates
+    - name: Manager - point the indexer connection at this node
+      ansible.builtin.replace:
+        path: /var/ossec/etc/ossec.conf
+        regexp: '<host>https://0\.0\.0\.0:9200</host>'
+        replace: '<host>https://{{ node_ip }}:9200</host>'
+
+    - name: Filebeat - config, alerts template
       ansible.builtin.copy:
-        src: "{{ certs_dir }}/wazuh-certificates/{{ item.src }}"
-        dest: "/etc/wazuh-indexer/certs/{{ item.dest }}"
+        src: "{{ staging }}/{{ item.src }}"
+        dest: "/etc/filebeat/{{ item.src }}"
         remote_src: true
-        owner: wazuh-indexer
-        group: wazuh-indexer
-        mode: "0400"
+        mode: "{{ item.mode }}"
       loop:
-        - { src: "{{ indexer_node }}.pem",     dest: indexer.pem }
-        - { src: "{{ indexer_node }}-key.pem", dest: indexer-key.pem }
-        - { src: admin.pem,                    dest: admin.pem }
-        - { src: admin-key.pem,                dest: admin-key.pem }
-        - { src: root-ca.pem,                  dest: root-ca.pem }
+        - { src: filebeat.yml,        mode: "0600" }
+        - { src: wazuh-template.json, mode: "0644" }
 
-    - name: Start wazuh-indexer
+    - name: Filebeat - point at this node's indexer
+      ansible.builtin.replace:
+        path: /etc/filebeat/filebeat.yml
+        regexp: 'hosts: \[.*\]'
+        replace: 'hosts: ["{{ node_ip }}:9200"]'
+
+    - name: Filebeat - keystore with the indexer credentials
+      ansible.builtin.shell: |
+        filebeat keystore create --force
+        echo '{{ indexer_user }}'     | filebeat keystore add username --stdin --force
+        echo '{{ indexer_password }}' | filebeat keystore add password --stdin --force
+      no_log: true
+      changed_when: false
+
+    - name: Filebeat - Wazuh module
+      ansible.builtin.unarchive:
+        src: "{{ staging }}/filebeat-module.tgz"
+        dest: /usr/share/filebeat/module
+        remote_src: true
+
+    - name: Dashboard - indexer address
+      ansible.builtin.lineinfile:
+        path: /etc/wazuh-dashboard/opensearch_dashboards.yml
+        regexp: '^opensearch\.hosts:'
+        line: 'opensearch.hosts: https://{{ node_ip }}:9200'
+
+    - name: Dashboard - Wazuh app config folder
+      ansible.builtin.file:
+        path: /usr/share/wazuh-dashboard/data/wazuh/config
+        state: directory
+        owner: wazuh-dashboard
+        group: wazuh-dashboard
+        mode: "0750"
+
+    - name: Dashboard - connection to the Wazuh server API
+      ansible.builtin.copy:
+        dest: /usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
+        owner: wazuh-dashboard
+        group: wazuh-dashboard
+        mode: "0600"
+        content: |
+          hosts:
+            - default:
+                url: https://127.0.0.1
+                port: 55000
+                username: wazuh-wui
+                password: wazuh-wui
+                run_as: true
+
+    # ------------------------------------------------------------------ 5. start (in parallel where possible)
+    - name: Reload systemd units
       ansible.builtin.systemd:
-        name: wazuh-indexer
+        daemon_reload: true
+
+    - name: Start wazuh-indexer and wazuh-manager together
+      ansible.builtin.systemd:
+        name: "{{ item }}"
         state: restarted
         enabled: true
-        daemon_reload: true
+      loop: [wazuh-indexer, wazuh-manager]
+      async: 600
+      poll: 0
+      register: core_start
 
     - name: Wait for the indexer port
       ansible.builtin.wait_for:
@@ -182,114 +347,26 @@
       delay: 10
       until: indexer_info.status == 200
 
-    # ------------------------------------------------------------------ 3. manager
-    - name: Install wazuh-manager from the lab repo (newest)
-      ansible.builtin.apt:
-        name: wazuh-manager
-        state: latest
-
-    - name: Store indexer credentials in the manager keystore
-      ansible.builtin.shell: |
-        echo '{{ indexer_user }}'     | /var/ossec/bin/wazuh-keystore -f indexer -k username
-        echo '{{ indexer_password }}' | /var/ossec/bin/wazuh-keystore -f indexer -k password
-      no_log: true
-      changed_when: false
-
-    - name: Point the manager's indexer connection at this node
-      ansible.builtin.replace:
-        path: /var/ossec/etc/ossec.conf
-        regexp: '<host>https://0\.0\.0\.0:9200</host>'
-        replace: '<host>https://{{ node_ip }}:9200</host>'
-
-    - name: Start wazuh-manager
+    - name: Start Filebeat and wazuh-dashboard together
       ansible.builtin.systemd:
-        name: wazuh-manager
+        name: "{{ item }}"
         state: restarted
         enabled: true
-        daemon_reload: true
+      loop: [filebeat, wazuh-dashboard]
+      async: 600
+      poll: 0
+      register: edge_start
 
-    # ------------------------------------------------------------------ 4. Filebeat (ships alerts to the indexer)
-    - name: Download Filebeat OSS
-      ansible.builtin.get_url:
-        url: "{{ filebeat_deb_url }}"
-        dest: /root/filebeat-oss-7.10.2-amd64.deb
-        mode: "0644"
-
-    - name: Install Filebeat
-      ansible.builtin.apt:
-        deb: /root/filebeat-oss-7.10.2-amd64.deb
-
-    - name: Download the Wazuh filebeat.yml
-      ansible.builtin.get_url:
-        url: "{{ filebeat_yml_url }}"
-        dest: /etc/filebeat/filebeat.yml
-        mode: "0600"
-        force: true
-
-    - name: Point Filebeat at this node's indexer
-      ansible.builtin.replace:
-        path: /etc/filebeat/filebeat.yml
-        regexp: 'hosts: \[.*\]'
-        replace: 'hosts: ["{{ node_ip }}:9200"]'
-
-    - name: Filebeat keystore with the indexer credentials
-      ansible.builtin.shell: |
-        filebeat keystore create --force
-        echo '{{ indexer_user }}'     | filebeat keystore add username --stdin --force
-        echo '{{ indexer_password }}' | filebeat keystore add password --stdin --force
-      no_log: true
-      changed_when: false
-
-    - name: Alerts template from YOUR wazuh fork (pinned commit)
-      ansible.builtin.get_url:
-        url: "{{ wazuh_template_url | default(wazuh_template_fallback_url) }}"
-        dest: /etc/filebeat/wazuh-template.json
-        mode: "0644"
-        force: true
-      register: template_fork
-      ignore_errors: true
-
-    - name: Alerts template fallback (official v4.14.10) if the fork URL failed
-      ansible.builtin.get_url:
-        url: "{{ wazuh_template_fallback_url }}"
-        dest: /etc/filebeat/wazuh-template.json
-        mode: "0644"
-        force: true
-      when: template_fork is failed
-
-    - name: Install the Wazuh module for Filebeat
-      ansible.builtin.unarchive:
-        src: "{{ filebeat_module_url }}"
-        dest: /usr/share/filebeat/module
-        remote_src: true
-
-    - name: Create the Filebeat certs folder
-      ansible.builtin.file:
-        path: /etc/filebeat/certs
-        state: directory
-        owner: root
-        group: root
-        mode: "0500"
-
-    - name: Deploy Filebeat certificates
-      ansible.builtin.copy:
-        src: "{{ certs_dir }}/wazuh-certificates/{{ item.src }}"
-        dest: "/etc/filebeat/certs/{{ item.dest }}"
-        remote_src: true
-        owner: root
-        group: root
-        mode: "0400"
-      loop:
-        - { src: "{{ server_node }}.pem",     dest: filebeat.pem }
-        - { src: "{{ server_node }}-key.pem", dest: filebeat-key.pem }
-        - { src: root-ca.pem,                 dest: root-ca.pem }
-
-    - name: Start Filebeat
-      ansible.builtin.systemd:
-        name: filebeat
-        state: restarted
-        enabled: true
-        daemon_reload: true
+    - name: Confirm all four services started
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ core_start.results + edge_start.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      register: start_jobs
+      until: start_jobs.finished
+      retries: 60
+      delay: 5
 
     - name: Test Filebeat -> indexer connection
       ansible.builtin.command: filebeat test output
@@ -299,69 +376,6 @@
       delay: 10
       until: fb_test.rc == 0
 
-    # ------------------------------------------------------------------ 5. dashboard
-    - name: Install wazuh-dashboard from the lab repo (newest)
-      ansible.builtin.apt:
-        name: wazuh-dashboard
-        state: latest
-
-    - name: Configure opensearch_dashboards.yml - indexer address
-      ansible.builtin.lineinfile:
-        path: /etc/wazuh-dashboard/opensearch_dashboards.yml
-        regexp: '^opensearch\.hosts:'
-        line: 'opensearch.hosts: https://{{ node_ip }}:9200'
-
-    - name: Create the dashboard certs folder
-      ansible.builtin.file:
-        path: /etc/wazuh-dashboard/certs
-        state: directory
-        owner: wazuh-dashboard
-        group: wazuh-dashboard
-        mode: "0500"
-
-    - name: Deploy dashboard certificates
-      ansible.builtin.copy:
-        src: "{{ certs_dir }}/wazuh-certificates/{{ item.src }}"
-        dest: "/etc/wazuh-dashboard/certs/{{ item.dest }}"
-        remote_src: true
-        owner: wazuh-dashboard
-        group: wazuh-dashboard
-        mode: "0400"
-      loop:
-        - { src: "{{ dashboard_node }}.pem",     dest: dashboard.pem }
-        - { src: "{{ dashboard_node }}-key.pem", dest: dashboard-key.pem }
-        - { src: root-ca.pem,                    dest: root-ca.pem }
-
-    - name: Create the Wazuh app config folder
-      ansible.builtin.file:
-        path: /usr/share/wazuh-dashboard/data/wazuh/config
-        state: directory
-        owner: wazuh-dashboard
-        group: wazuh-dashboard
-        mode: "0750"
-
-    - name: Connect the dashboard to the Wazuh server API
-      ansible.builtin.copy:
-        dest: /usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml
-        owner: wazuh-dashboard
-        group: wazuh-dashboard
-        mode: "0600"
-        content: |
-          hosts:
-            - default:
-                url: https://127.0.0.1
-                port: 55000
-                username: wazuh-wui
-                password: wazuh-wui
-                run_as: true
-
-    - name: Start wazuh-dashboard
-      ansible.builtin.systemd:
-        name: wazuh-dashboard
-        state: restarted
-        enabled: true
-        daemon_reload: true
-
     - name: Wait for the dashboard port
       ansible.builtin.wait_for:
         host: "{{ node_ip }}"
@@ -369,13 +383,15 @@
         timeout: 300
 
     # ------------------------------------------------------------------ 6. summary
-    - name: Installed versions
-      ansible.builtin.shell: dpkg-query -W -f='${Package} ${Version}\n' wazuh-indexer wazuh-manager wazuh-dashboard filebeat
+    - name: Installed versions and template source
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package} ${Version}\n' wazuh-indexer wazuh-manager wazuh-dashboard filebeat
+        echo "alerts template: $(cat {{ staging }}/template.source)"
       register: versions
       changed_when: false
 
     - name: Done
       ansible.builtin.debug:
         msg:
-          - "Installed: {{ versions.stdout_lines | join(' | ') }}"
+          - "{{ versions.stdout_lines }}"
           - "Dashboard: https://{{ node_ip }}  (user: {{ indexer_user }} / password: {{ indexer_password }})"
