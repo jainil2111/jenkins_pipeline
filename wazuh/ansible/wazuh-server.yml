@@ -64,16 +64,24 @@
         rm -rf /var/lib/wazuh-indexer /usr/share/wazuh-indexer /etc/wazuh-indexer
         /var/ossec /etc/filebeat /var/lib/filebeat /usr/share/filebeat
         /etc/wazuh-dashboard /usr/share/wazuh-dashboard /var/lib/wazuh-dashboard
+        /var/log/wazuh-indexer /var/log/wazuh-dashboard /var/log/filebeat
         {{ certs_dir }} /root/.wazuh-indexer-initialized
       when: clean_install | bool
 
     - name: Clean install - purge the packages (now quick)
       ansible.builtin.shell: |
-        PKGS=$(dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' wazuh-dashboard filebeat wazuh-manager wazuh-indexer 2>/dev/null | awk '$2 ~ /^[ihr]/ {print $1}')
+        PKGS=$(dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' wazuh-dashboard filebeat wazuh-manager wazuh-indexer 2>/dev/null | awk 'substr($2,2,1) != "n" {print $1}')   # 2nd letter = actual state; n = not installed
         [ -z "$PKGS" ] && { echo "nothing installed"; exit 0; }
-        # removal scripts may look for programs we already deleted: fall back to a forced purge
-        apt-get purge -y -q $PKGS || dpkg --purge --force-all $PKGS
-        LEFT=$(dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' $PKGS 2>/dev/null | awk '$2 !~ /^[up]n/ {print $1}')
+        # The program folders are already gone, so the packages' own removal scripts would fail
+        # (e.g. wazuh-manager's prerm calls /var/ossec/bin/...). Replace them with no-ops first.
+        for p in $PKGS; do
+          for s in prerm postrm; do
+            f=/var/lib/dpkg/info/$p.$s
+            [ -f "$f" ] && printf '#!/bin/sh\nexit 0\n' > "$f"
+          done
+        done
+        dpkg --purge $PKGS || dpkg --purge --force-remove-reinstreq $PKGS
+        LEFT=$(dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' $PKGS 2>/dev/null | awk 'substr($2,2,1) != "n" {print $1}')
         [ -z "$LEFT" ] || { echo "still installed: $LEFT"; exit 1; }
         echo "purged: $PKGS"
       environment: "{{ apt_env }}"
